@@ -193,25 +193,18 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         data_temp = r_json('result_' + str(first_time) + '/all_achievement')
         all_achievement = data_temp
         data_temp = r_json('result_' + str(first_time) + '/assignment')
-        for i in data_temp:
-            assignment_url.add(i)
+        assignment_url.update(set(data_temp))
         data_temp = r_json('result_' + str(first_time) + '/searching_url')
-        for i in data_temp:
-            ritsumei_url.add(i)
+        ritsumei_url.update(set(data_temp))
         data_temp = r_json('result_' + str(first_time) + '/unsearching_url')
-        for i in data_temp:
-            notRitsumei_url.add(i)
+        notRitsumei_url.update(set(data_temp))
         data_temp = r_json('result_' + str(first_time) + '/black_url')
-        for i in data_temp:
-            black_url.add(i)
+        black_url.update(set(data_temp))
         data_temp = r_json('result_' + str(first_time) + '/url_list')
-        for i in data_temp:
-            url_list.append(tuple(i))
-        for url in url_list:
-            assignment_url.discard(url[0])
+        url_list.extend([tuple(i) for i in data_temp])
+        assignment_url.difference_update(set([i[0] for i in url_list]))
         data_temp = r_json('result_' + str(first_time) + '/waiting_list')
-        for i in data_temp:
-            waiting_list.append(tuple(i))
+        waiting_list.extend([tuple(i) for i in data_temp])
     # 作業ディレクトリを作って移動
     try:
         os.mkdir('result_' + str(first_time + 1))
@@ -268,6 +261,7 @@ def print_progress(run_time_pp, max_process, current_achievement):
             count += 1    # remainingが0のホスト数をカウント
         else:
             # プロセスが死んでいて、キューにURLが残っている場合、キューから1つ取り出し、url_listに加える
+            # 子プロセスが親プロセスに殺されると、これにあたる可能性がでてくる
             if not hostName_process[host].is_alive():
                 if not hostName_queue[host]['parent_send'].empty():
                     if alive_count < max_process:
@@ -299,7 +293,7 @@ def print_progress(run_time_pp, max_process, current_achievement):
 def forced_termination():
     global remaining, all_achievement
     print('main : forced_termination')
-    url_list_ft = []
+    url_list_ft = list()
     while not end():
         for queue in hostName_queue.values():    # 子に送信する用の
             while True:
@@ -383,7 +377,7 @@ def make_url_list(now_time):
         thread_set.remove(thread)
 
 
-# 接続するべきURLかどうかのチェックスレッドを起動する
+# クローリング対象のURLかどうかのチェックスレッドを起動する
 def thread_start(url_tuple):
     t = CheckSearchedUrlThread(url_tuple, int(time()), necessary_list_dict,)
     t.setDaemon(True)
@@ -489,7 +483,7 @@ def receive():
                     wa_file('../alert/new_window_url.csv', url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
             elif received_data['type'] == 'redirect':
                 url_tuple = received_data['url_tuple_list'][0]   # リダイレクトの場合、リストの要素数は１個だけ
-                if url_tuple[0] in notRitsumei_url:  # 立命館ではないURLへのリダイレクトならば
+                if url_tuple[0] in notRitsumei_url:  # 外部組織サーバへのリダイレクトならば
                     host_name = urlparse(url_tuple[0]).netloc
                     if host_name not in after_redirect_list:
                         wa_file('../alert/after_redirect_check.csv',
@@ -504,11 +498,11 @@ def receive():
                 recv_num += len(url_tuple_list)
                 # リンク集から取り出してwaiting_listに追加。
                 for url_tuple in url_tuple_list:
-                    if url_tuple[0] in notRitsumei_url:       # 既にチェック済みで立命館ではないと分かっているため
+                    if url_tuple[0] in notRitsumei_url:   # 既にチェック済みでクローリングしないURLと分かっているため
                         pass
-                    elif url_tuple[0] in black_url:          # ブラックリストに入っているため
+                    elif url_tuple[0] in black_url:       # ブラックリストに入っているため
                         pass
-                    elif url_tuple[0] in ritsumei_url:       # 既に割り当て済みで立命館
+                    elif url_tuple[0] in ritsumei_url:    # 既に割り当て済みで立命館
                         pass
                     else:
                         waiting_list.append(url_tuple)    # まだ割り当てていないためチェック待ちリストに入れる
@@ -728,7 +722,7 @@ def main():
                 else:
                     print("main : number of thread is over 2000.")
 
-            # 立命館かどうかのチェックが終わったものからurl_listに追加する
+            # クローリングするURLかどうかのチェックが終わったものからurl_listに追加する
             make_url_list(now)
 
             # url_list(子プロセスに送るURLのタプルのリスト)が空じゃなければ取り出す
