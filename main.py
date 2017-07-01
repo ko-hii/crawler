@@ -40,7 +40,7 @@ all_achievement = 0
 
 def get_setting_dict(path):
     setting = dict()
-    bool_variable_list = ['assignOrAchievement', 'screenshots', 'clamd_scan', 'machine_learning', 'phantomjs']
+    bool_variable_list = ['assignOrAchievement', 'screenshots', 'clamd_scan', 'machine_learning', 'phantomjs', 'mecab']
     setting_file = r_file(path + '/SETTING.txt')
     setting_line = setting_file.split('\n')
     for line in setting_line:
@@ -234,7 +234,7 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         sendq = Queue()
         machine_learning_q['recv'] = recvq
         machine_learning_q['send'] = sendq
-        p = Process(target=machine_learning_main, args=(recvq, sendq))
+        p = Process(target=machine_learning_main, args=(recvq, sendq, '../../ROD/tag_data'))
         p.daemon = True
         p.start()
         print('main : wait for machine learning...')
@@ -417,6 +417,7 @@ def choice_process(url_tuple, max_process, setting_dict):
         else:
             args_dic['machine_learning_q'] = False
         args_dic['phantomjs'] = setting_dict['phantomjs']
+        args_dic['mecab'] = setting_dict['mecab']
         args_dic['screenshots'] = setting_dict['screenshots']
         hostName_args[host_name] = args_dic    # クローラプロセスの引数は、サーバ毎に毎回同じなので保存しておく
 
