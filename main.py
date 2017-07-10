@@ -38,6 +38,7 @@ recv_num = 0  # 途中経過で表示する5秒ごとの子プロセスから受
 all_achievement = 0
 
 
+# 設定ファイルの読み込み
 def get_setting_dict(path):
     setting = dict()
     bool_variable_list = ['assignOrAchievement', 'screenshots', 'clamd_scan', 'machine_learning', 'phantomjs', 'mecab']
@@ -110,8 +111,8 @@ def get_setting_dict(path):
     return setting
 
 
+# 必要なリストをインポート
 def import_file(path):             # 実行でディレクトリは「crawler」
-    # 必要なリストをインポート
     global after_redirect_list
     if os.path.exists(path + '/DOMAIN.txt'):
         data_temp = r_file(path + '/DOMAIN.txt')
@@ -146,7 +147,7 @@ def import_file(path):             # 実行でディレクトリは「crawler」
             necessary_list_dict['white_list'] = list()
     else:
         necessary_list_dict['white_list'] = list()
-    if os.path.exists(path + '/IPAddress_LIST.txt'):
+    if os.path.exists(path + '/IPAddress_LIST.txt'):     # 接続するIPアドレスのリスト(今はこれに当てはまっていても接続していない)
         data_temp = r_file(path + '/IPAddress_LIST.txt')
         if data_temp:
             necessary_list_dict['IPAddress_list'] = data_temp.split('\n')
@@ -155,12 +156,13 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     else:
         necessary_list_dict['IPAddress_list'] = list()
 
-    if os.path.exists(path + '/REDIRECT_LIST.txt'):
+    if os.path.exists(path + '/REDIRECT_LIST.txt'):   # 外部サイトへのリダイレクトとして安全が確認されたホスト名のリスト
         data_temp = r_file(path + '/REDIRECT_LIST.txt')
         if data_temp:
             after_redirect_list = data_temp.split('\n')
 
 
+# 必要なディレクトリを作成
 def make_dir(screenshots):          # 実行ディレクトリは「crawler」
     if not os.path.exists('ROD/url_hash_json'):
         os.mkdir('ROD/url_hash_json')
@@ -181,6 +183,7 @@ def make_dir(screenshots):          # 実行ディレクトリは「crawler」
             os.mkdir('image')
 
 
+# いろいろと最初の処理
 def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクトリは「result」、最後の方に「result_*」に移動
     global all_achievement
     # 検索済みURL、検索待ちURLなど、途中保存データを読み込む。一回目の実行の場合は、START_LISTだけ読み込む。
@@ -190,20 +193,20 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         for ini in data_temp:
             waiting_list.append((ini, 'START'))
     else:
-        data_temp = r_json('result_' + str(first_time) + '/all_achievement')
+        data_temp = r_json('result_' + str(first_time) + '/all_achievement')   # 総達成数
         all_achievement = data_temp
-        data_temp = r_json('result_' + str(first_time) + '/assignment')
+        data_temp = r_json('result_' + str(first_time) + '/assignment')   # 子プロセスに割り当てたURLの集合
         assignment_url.update(set(data_temp))
-        data_temp = r_json('result_' + str(first_time) + '/searching_url')
+        data_temp = r_json('result_' + str(first_time) + '/searching_url')  # クローリングするURLの集合(割り当てたかどうかは関係ない)
         ritsumei_url.update(set(data_temp))
-        data_temp = r_json('result_' + str(first_time) + '/unsearching_url')
+        data_temp = r_json('result_' + str(first_time) + '/unsearching_url')  # クローリングしない(組織外だと判断された)URLの集合
         notRitsumei_url.update(set(data_temp))
-        data_temp = r_json('result_' + str(first_time) + '/black_url')
+        data_temp = r_json('result_' + str(first_time) + '/black_url')  # 組織内だがクローリングしないと判断されたURLの集合
         black_url.update(set(data_temp))
-        data_temp = r_json('result_' + str(first_time) + '/url_list')
+        data_temp = r_json('result_' + str(first_time) + '/url_list')  # これから子プロセスに割り当てるURLの集合
         url_list.extend([tuple(i) for i in data_temp])
-        assignment_url.difference_update(set([i[0] for i in url_list]))
-        data_temp = r_json('result_' + str(first_time) + '/waiting_list')
+        assignment_url.difference_update(set([i[0] for i in url_list]))  # これから割り当てるので、割り当て集合から削除しておく必要(割り当ての際にチェックされるため)
+        data_temp = r_json('result_' + str(first_time) + '/waiting_list')  # クローリングするかしないかのチェックをしていないURLの集合
         waiting_list.extend([tuple(i) for i in data_temp])
     # 作業ディレクトリを作って移動
     try:
@@ -216,16 +219,15 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         # clamdを使うためのプロセスを起動(その子プロセスでclamdを起動)
         recvq = Queue()
         sendq = Queue()
-        clamd_q['recv'] = recvq
-        clamd_q['send'] = sendq
+        clamd_q['recv'] = recvq   # clamdプロセスが受け取る用のキュー
+        clamd_q['send'] = sendq   # clamdプロセスから送信する用のキュー
         p = Process(target=clamd.clamd_main, args=(recvq, sendq))
-        p.daemon = True
+        p.daemon = True   # デーモン設定により、メインは子プロセスが死んでいなくても死ぬことができる
         p.start()
-        connect = sendq.get(block=True)
-        if connect:
-            print('main : connect to clamd')
+        if sendq.get(block=True):
+            print('main : connect to clamd')   # clamdに接続できたようなら次へ
         else:
-            print("main : couldn't connect to clamd")
+            print("main : couldn't connect to clamd")  # できなかったようならFalseを返す
             return False
         os.mkdir('clamd_files')
     if machine_learning_:
@@ -242,7 +244,8 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
     return True
 
 
-# クローリング子プロセスの中で生きている数を返す
+# 各子プロセスの達成数を足し合わせて返す
+# 達成数 = ページ数(リンク集が返ってきた数) + ファイル数(ファイルの達成通知の数)
 def get_achievement_amount():
     achievement = 0
     for achievement_num in hostName_achievement.values():
@@ -294,27 +297,33 @@ def forced_termination():
     global remaining, all_achievement
     print('main : forced_termination')
     url_list_ft = list()
+
+    # 子に送信する用のキューからURLデータを抜き出し、end()がTrueを返すまで回り続ける
     while not end():
-        for queue in hostName_queue.values():    # 子に送信する用の
+        for queue in hostName_queue.values():
             while True:
                 try:
                     url_tuple = queue['parent_send'].get(block=False)  # 子に送信したURLのタプルを全て取り出す
                 except Exception:
                     break
                 else:
-                    url_list_ft.append(url_tuple)
-        receive()
+                    url_list_ft.append(url_tuple)   # 続きをする際にもう一度割り振るため、保存しておく
+        receive()   # 子プロセスからのデータを抜き取る
         for host_name, host_name_remaining in hostName_remaining.items():
             if host_name_remaining:
                 print('main : ' + host_name + ' : remaining --> ' + str(host_name_remaining))
         print('main : alive process : ' + str(get_alive_child_num()))
         del_child(int(time()))
         sleep(3)
+
+    # クローリングをするURLかどうかのチェックをしているスレッドが全て完了するまで回り続ける
     while thread_set:
         make_url_list(int(time()))
         print('main : wait ritsumeikan check thread...')
         print('main : remaining ' + str(len(thread_set)))
         sleep(3)
+
+    # 続きをするために途中経過を保存する
     all_achievement += get_achievement_amount()
     url_list_ft.extend(url_list)
     w_json(name='url_list', data=url_list_ft)
@@ -336,15 +345,16 @@ def end():
         if not (q_e['parent_send'].empty()):
             return False
     if get_alive_child_num():
-        print('main : exist child process.')
+        # print('main : exist child process.')
         return False
     else:
         return True
 
 
-# checkスレッド後が終わったURLのタプルから、子プロセスに送るためのリストに追加する
+# checkスレッド後が終わったURLのタプルを、子プロセスに送るためのリストに追加する
 # 外部リンクでリダイレクト後だった場合、ファイルに出力する
 # url_listを更新後、チェックを終えたスレッドidはスレッド集合から削除する
+# もしくは、300秒以上たってもスレッドが終わらない場合もスレッド集合から削除する
 def make_url_list(now_time):
     del_list = list()
     for thread in thread_set:
@@ -367,12 +377,12 @@ def make_url_list(now_time):
                         wa_file('after_redirect.csv',
                                 thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
             del_list.append(thread)
-            thread.lock.release()
+            thread.lock.release()    # スレッドは最後にロックをして待っているのでリリースして終わらせる
         else:
             if now_time - thread.result > 300:    # 300秒経っても終わらない場合は削除
                 wa_file('cant_done_check_thread.csv', thread.url_tuple[0] + ',' + thread.url_tuple[1] + '\n')
                 del_list.append(thread)
-                thread.lock.release()
+                thread.lock.release()   # スレッドは最後にロックをして待っているのでリリースして終わらせる
     for thread in del_list:
         thread_set.remove(thread)
 
@@ -380,7 +390,7 @@ def make_url_list(now_time):
 # クローリング対象のURLかどうかのチェックスレッドを起動する
 def thread_start(url_tuple):
     t = CheckSearchedUrlThread(url_tuple, int(time()), necessary_list_dict,)
-    t.setDaemon(True)
+    t.setDaemon(True)   # メインが死ぬとスレッドも死ぬ(メインはスレッドが生きていても死ぬことができる)
     try:
         t.start()
     except RuntimeError:
@@ -446,6 +456,7 @@ def choice_process(url_tuple, max_process, setting_dict):
     return host_name
 
 
+# クローリング子プロセスの中で生きている数を返す
 def get_alive_child_num():
     count = 0
     for temp in hostName_process.values():
@@ -455,23 +466,23 @@ def get_alive_child_num():
 
 
 # 子プロセスからの情報を受信する
-# 受信したリストの中のURLは全てwaiting_listに追加する。検索済み数を更新する。
+# 受信したリストの中のURLはwaiting_list(クローリングするURLかのチェック待ちリスト)に追加する。
 def receive():
     # 受信する型は、辞書、タプル、文字列の3種類
     # {'type': '文字列', 'url_tuple_list': [(url, src), (url, src),...]}の辞書
     # (url, 'redirect')のタプル(リダイレクトが起こったが、ホスト名が変わらなかったためそのまま処理された場合)
-    # "receive"の文字(子プロセスがURLを受け取るたびに送信する)
+    # "receive"の文字(子プロセスがURLのタプルを受け取るたびに送信する)
     global recv_num
-    for host_name, process_r in hostName_process.items():
+    for host_name, queue in hostName_queue.items():
         try:
-            received_data = hostName_queue[host_name]['child_send'].get(block=False)
-        except Exception:
+            received_data = queue['child_send'].get(block=False)
+        except Exception:   # queueにデータがなければエラーが出る
             continue
-        if type(received_data) is str:
-            hostName_remaining[host_name] -= 1    # キューに残っているURL数をデクリメント
-        elif type(received_data) is tuple:       # リダイレクトしたが、ホスト名が変わらなかったため子プロセスで処理を続行
-            assignment_url.add(received_data[0])
-            ritsumei_url.add(received_data[0])
+        if type(received_data) is str:          # 子プロセスが情報を受け取ったことの確認
+            hostName_remaining[host_name] -= 1   # キューに残っているURL数をデクリメント
+        elif type(received_data) is tuple:      # リダイレクトしたが、ホスト名が変わらなかったため子プロセスで処理を続行
+            assignment_url.add(received_data[0])  # リダイレクト後のURLを割り当てURL集合に追加
+            ritsumei_url.add(received_data[0])    # 立命館URL集合にも追加
         elif type(received_data) is dict:
             if received_data['type'] == 'links':
                 hostName_achievement[host_name] += 1   # ページクローリング結果なので、検索済み数更新
@@ -510,7 +521,7 @@ def receive():
 
 
 # 子プロセスが終了しない、子のメインループも回ってなく、どこかで止まっている場合、親から強制終了させる
-# 基準は、親が子に送信する用のキューに同じ情報が300秒以上入っているかどうか
+# 基準は、親が子に送信する用のキューに同じデータが300秒以上入っているかどうか
 def del_child(now):
     for process_dc in hostName_process.values():
         pid_dc = process_dc.pid
@@ -620,17 +631,25 @@ def main():
         if os.path.exists('RAD'):
             print('RAD directory exists.')
             print('If this running is at first time, please delete this dire.')
-            print('Else, you should compile the run_count in SETTING.txt.')
+            print('Else, you should check the run_count in SETTING.txt.')
             return False
         os.mkdir('RAD')
         make_dir(screenshots)
         copytree('ROD/url_hash_json', 'RAD/url_hash_json')
         copytree('ROD/url_hash_json2', 'RAD/url_hash_json2')
         copytree('ROD/tag_data', 'RAD/tag_data')
-        with open('RAD/README.txt', 'w') as f:
+        with open('RAD/READ.txt', 'w') as f:
             f.writelines("This directory's files are read and written.\n")
-            f.writelines("On the other hand, ROD directory's files are not written, Read only.")
+            f.writelines("On the other hand, ROD directory's files are not written, Read only.\n\n")
+            f.writelines('------------------------------------\n')
+            f.writelines('When crawling is finished, you should overwrite the ROD/...\n')
+            f.writelines('tag_data/, url_hash_json/, url_hash_json2/\n')
+            f.writelines("... by this directory's ones for next crawling by yourself.\n")
+            f.writelines('Then, you move df_dict in this directory to ROD/df_dicts/ to calculate idf_dict.\n')
+            f.writelines('After you done these, you may delete this(RAD) directory.\n')
+            f.writelines("To calculate idf_dict, you must run 'tf_idf.py'.")
 
+    # 必要なリストを読み込む
     import_file(path='ROD/LIST')
 
     try:
@@ -734,6 +753,7 @@ def main():
             if url_tuple[0] in assignment_url:    # 滅多にないが同じものが送られていることがある気がする
                 wa_file('assign.txt', url_tuple[0] + '\n')
                 continue
+            url_tuple = ('http://www.spice.ci.ritsumei.ac.jp/top/index-j.html', 'start')
 
             # URLのホスト名から、それを担当しているプロセスがなければ(死んでいれば)生成。
             host_name = choice_process(url_tuple, max_process, setting_dict)
@@ -760,7 +780,6 @@ def main():
         run_time = int(time()) - current_start_time
         print('run time = ' + str(run_time))
         print('remaining = ' + str(remaining))
-
         wa_file('result.txt', 'assignment_url = ' + str(len(assignment_url)) + '\n' +
                 'current achievement = ' + str(current_achievement) + '\n' +
                 'all achievement = ' + str(all_achievement) + '\n' +
@@ -769,7 +788,7 @@ def main():
                 'remaining = ' + str(remaining) + '\n' +
                 'date = ' + str(date.today()) + '\n')
 
-        print('main : save...')
+        print('main : save...')   # 途中結果を保存する
         os.mkdir('TEMP')
         copytree('../../RAD/df_dict', 'TEMP/df_dict')
         copytree('../../RAD/tag_data', 'TEMP/tag_data')
@@ -781,12 +800,12 @@ def main():
 
         if machine_learning_:
             print('wait for machine learning process')
-            machine_learning_q['recv'].put('end')
-            machine_learning_q['send'].get(block=True)
+            machine_learning_q['recv'].put('end')       # 機械学習プロセスに終わりを知らせる
+            machine_learning_q['send'].get(block=True)  # 機械学習プロセスが終わるのを待つ
         if clamd_scan:
             print('wait for clamd process')
-            clamd_q['recv'].put('end')
-            clamd_q['send'].get(block=True)
+            clamd_q['recv'].put('end')        # clamdプロセスに終わりを知らせる
+            clamd_q['send'].get(block=True)   # clamdプロセスが終わるのを待つ
 
         # メインループをもう一度回すかどうか
         if save:
