@@ -605,7 +605,7 @@ def del_child(now):
                 pass
 
 
-def main():
+def crawler_main():
     global hostName_achievement, hostName_pid, hostName_process, hostName_queue, hostName_remaining, pid_time
     global notRitsumei_url, ritsumei_url, black_url, waiting_list, url_list, assignment_url, thread_set
     global remaining, send_num, recv_num, all_achievement
@@ -753,7 +753,6 @@ def main():
             if url_tuple[0] in assignment_url:    # 滅多にないが同じものが送られていることがある気がする
                 wa_file('assign.txt', url_tuple[0] + '\n')
                 continue
-            url_tuple = ('http://www.spice.ci.ritsumei.ac.jp/top/index-j.html', 'start')
 
             # URLのホスト名から、それを担当しているプロセスがなければ(死んでいれば)生成。
             host_name = choice_process(url_tuple, max_process, setting_dict)
@@ -818,4 +817,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    crawler_main()
