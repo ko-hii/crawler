@@ -2,14 +2,14 @@
 from urllib.parse import urlparse
 from collections import deque
 from time import time, sleep
-import crawler3
+from crawler3 import crawler_main
 from file_rw import wa_file, r_file, w_json, r_json
 from check_searched_url import CheckSearchedUrlThread
 from threading import active_count
 import os
 from datetime import date
 from machine_learning import machine_learning_main
-import clamd
+from clamd import clamd_main
 from shutil import copytree
 
 necessary_list_dict = dict()   # 接続すべきURLかどうか判断するのに必要なリストをまとめた辞書
@@ -117,7 +117,7 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     if os.path.exists(path + '/DOMAIN.txt'):
         data_temp = r_file(path + '/DOMAIN.txt')
         if data_temp:
-            data_temp = data_temp.split('#')[1]
+            data_temp = data_temp.split('###')[1]
             necessary_list_dict['domain_list'] = data_temp.split('\n')[1:]      # 組織内ドメインリスト
         else:
             necessary_list_dict['domain_list'] = list()
@@ -126,7 +126,8 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     if os.path.exists(path + '/NOT_DOMAIN.txt'):
         data_temp = r_file(path + '/NOT_DOMAIN.txt')
         if data_temp:
-            necessary_list_dict['not_domain_list'] = data_temp.split('\n')  # 組織外ドメインリスト
+            data_temp = data_temp.split('###')[1]
+            necessary_list_dict['not_domain_list'] = data_temp.split('\n')[1:]  # 組織外ドメインリスト
         else:
             necessary_list_dict['not_domain_list'] = list()
     else:
@@ -134,7 +135,8 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     if os.path.exists(path + '/BLACK_LIST.txt'):
         data_temp = r_file(path + '/BLACK_LIST.txt')
         if data_temp:
-            necessary_list_dict['black_list'] = data_temp.split('\n')       # 組織内だが検査しないリスト
+            data_temp = data_temp.split('###')[1]
+            necessary_list_dict['black_list'] = data_temp.split('\n')[1:]       # 組織内だが検査しないリスト
         else:
             necessary_list_dict['black_list'] = list()
     else:
@@ -142,7 +144,8 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     if os.path.exists(path + '/WHITE_LIST.txt'):
         data_temp = r_file(path + '/WHITE_LIST.txt')
         if data_temp:
-            necessary_list_dict['white_list'] = data_temp.split('\n')  # ドメインは組織内ではないが、特定URLにおいて接続するリスト(google.siteなど
+            data_temp = data_temp.split('###')[1]
+            necessary_list_dict['white_list'] = data_temp.split('\n')[1:]  # 特定URLにおいて接続するリスト(google.siteなど
         else:
             necessary_list_dict['white_list'] = list()
     else:
@@ -162,12 +165,10 @@ def import_file(path):             # 実行でディレクトリは「crawler」
             after_redirect_list = data_temp.split('\n')
 
 
-# 必要なディレクトリを作成
+# 必要なディレクトリを作成(一回目のクローリング時のみ)
 def make_dir(screenshots):          # 実行ディレクトリは「crawler」
     if not os.path.exists('ROD/url_hash_json'):
         os.mkdir('ROD/url_hash_json')
-    if not os.path.exists('ROD/url_hash_json2'):
-        os.mkdir('ROD/url_hash_json2')
     if not os.path.exists('ROD/tag_data'):
         os.mkdir('ROD/tag_data')
     if not os.path.exists('RAD/df_dict'):
@@ -193,6 +194,9 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         for ini in data_temp:
             waiting_list.append((ini, 'START'))
     else:
+        if not os.path.exists('result_' + str(first_time)):
+            print('init : result_' + str(first_time) + 'that is the result of previous crawling is not found.')
+            return False
         data_temp = r_json('result_' + str(first_time) + '/all_achievement')   # 総達成数
         all_achievement = data_temp
         data_temp = r_json('result_' + str(first_time) + '/assignment')   # 子プロセスに割り当てたURLの集合
@@ -221,15 +225,13 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         sendq = Queue()
         clamd_q['recv'] = recvq   # clamdプロセスが受け取る用のキュー
         clamd_q['send'] = sendq   # clamdプロセスから送信する用のキュー
-        p = Process(target=clamd.clamd_main, args=(recvq, sendq))
-        p.daemon = True   # デーモン設定により、メインは子プロセスが死んでいなくても死ぬことができる
+        p = Process(target=clamd_main, args=(recvq, sendq))
         p.start()
         if sendq.get(block=True):
             print('main : connect to clamd')   # clamdに接続できたようなら次へ
         else:
             print("main : couldn't connect to clamd")  # できなかったようならFalseを返す
             return False
-        os.mkdir('clamd_files')
     if machine_learning_:
         # 機械学習を使うためのプロセスを起動
         recvq = Queue()
@@ -237,7 +239,6 @@ def init(first_time, clamd_scan, machine_learning_):    # 実行ディレクト�
         machine_learning_q['recv'] = recvq
         machine_learning_q['send'] = sendq
         p = Process(target=machine_learning_main, args=(recvq, sendq, '../../ROD/tag_data'))
-        p.daemon = True
         p.start()
         print('main : wait for machine learning...')
         print(sendq.get(block=True))   # 学習が終わるのを待つ(数分？)
@@ -370,7 +371,7 @@ def make_url_list(now_time):
                 # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
                 if len(thread.url_tuple) == 3:
                     host_name = urlparse(thread.url_tuple[0]).netloc
-                    if host_name not in after_redirect_list:
+                    if not [white for white in after_redirect_list if host_name.endswith(white)]:
                         wa_file('../alert/after_redirect_check.csv',
                                 thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
                     else:
@@ -382,7 +383,7 @@ def make_url_list(now_time):
             if now_time - thread.result > 300:    # 300秒経っても終わらない場合は削除
                 wa_file('cant_done_check_thread.csv', thread.url_tuple[0] + ',' + thread.url_tuple[1] + '\n')
                 del_list.append(thread)
-                thread.lock.release()   # スレッドは最後にロックをして待っているのでリリースして終わらせる
+                thread.lock.release()   # スレッドは最初にロックをしているのでリリースしておく
     for thread in del_list:
         thread_set.remove(thread)
 
@@ -390,7 +391,7 @@ def make_url_list(now_time):
 # クローリング対象のURLかどうかのチェックスレッドを起動する
 def thread_start(url_tuple):
     t = CheckSearchedUrlThread(url_tuple, int(time()), necessary_list_dict,)
-    t.setDaemon(True)   # メインが死ぬとスレッドも死ぬ(メインはスレッドが生きていても死ぬことができる)
+    t.setDaemon(True)   # メインはスレッドが生きていても死ぬことができる
     try:
         t.start()
     except RuntimeError:
@@ -403,7 +404,6 @@ def thread_start(url_tuple):
 def choice_process(url_tuple, max_process, setting_dict):
     host_name = urlparse(url_tuple[0]).netloc
     if host_name not in hostName_process:   # まだ作られていない場合、プロセス作成
-
         # www.ritsumei.ac.jpは子プロセス数が上限でも常に回したい(一番多いから)
         if not host_name == 'www.ritsumei.ac.jp':
             if get_alive_child_num() >= max_process:
@@ -432,7 +432,7 @@ def choice_process(url_tuple, max_process, setting_dict):
         hostName_args[host_name] = args_dic    # クローラプロセスの引数は、サーバ毎に毎回同じなので保存しておく
 
         # プロセス作成
-        p = Process(target=crawler3.crawler_main, name=host_name, args=(hostName_args[host_name],))
+        p = Process(target=crawler_main, name=host_name, args=(hostName_args[host_name],))
         p.daemon = True
         p.start()    # スタート
 
@@ -448,7 +448,7 @@ def choice_process(url_tuple, max_process, setting_dict):
                 return False
         print('main : ' + host_name + ' is not alive.')
         # プロセス作成
-        p = Process(target=crawler3.crawler_main, name=host_name, args=(hostName_args[host_name],))
+        p = Process(target=crawler_main, name=host_name, args=(hostName_args[host_name],))
         p.daemon = True
         p.start()   # スタート
         hostName_process[host_name] = p   # プロセスを指す辞書だけ更新する
@@ -605,7 +605,7 @@ def del_child(now):
                 pass
 
 
-def crawler_main():
+def crawler_host():
     global hostName_achievement, hostName_pid, hostName_process, hostName_queue, hostName_remaining, pid_time
     global notRitsumei_url, ritsumei_url, black_url, waiting_list, url_list, assignment_url, thread_set
     global remaining, send_num, recv_num, all_achievement
@@ -636,14 +636,13 @@ def crawler_main():
         os.mkdir('RAD')
         make_dir(screenshots)
         copytree('ROD/url_hash_json', 'RAD/url_hash_json')
-        copytree('ROD/url_hash_json2', 'RAD/url_hash_json2')
         copytree('ROD/tag_data', 'RAD/tag_data')
         with open('RAD/READ.txt', 'w') as f:
             f.writelines("This directory's files are read and written.\n")
             f.writelines("On the other hand, ROD directory's files are not written, Read only.\n\n")
             f.writelines('------------------------------------\n')
             f.writelines('When crawling is finished, you should overwrite the ROD/...\n')
-            f.writelines('tag_data/, url_hash_json/, url_hash_json2/\n')
+            f.writelines('tag_data/, url_hash_json/\n')
             f.writelines("... by this directory's ones for next crawling by yourself.\n")
             f.writelines('Then, you move df_dict in this directory to ROD/df_dicts/ to calculate idf_dict.\n')
             f.writelines('After you done these, you may delete this(RAD) directory.\n')
@@ -741,6 +740,7 @@ def crawler_main():
                         waiting_list.append(url_tuple)   # 失敗したら待ちリストに戻す
                 else:
                     print("main : number of thread is over 2000.")
+                    sleep(1)
 
             # クローリングするURLかどうかのチェックが終わったものからurl_listに追加する
             make_url_list(now)
@@ -792,7 +792,6 @@ def crawler_main():
         copytree('../../RAD/df_dict', 'TEMP/df_dict')
         copytree('../../RAD/tag_data', 'TEMP/tag_data')
         copytree('../../RAD/url_hash_json', 'TEMP/url_hash_json')
-        copytree('../../RAD/url_hash_json2', 'TEMP/url_hash_json2')
         copytree('../../RAD/temp', 'TEMP/temp')
         copytree('../alert', 'TEMP/alert')
         print('main : save done')
@@ -800,11 +799,11 @@ def crawler_main():
         if machine_learning_:
             print('wait for machine learning process')
             machine_learning_q['recv'].put('end')       # 機械学習プロセスに終わりを知らせる
-            machine_learning_q['send'].get(block=True)  # 機械学習プロセスが終わるのを待つ
+            print(machine_learning_q['send'].get(block=True))  # 機械学習プロセスが終わるのを待つ
         if clamd_scan:
             print('wait for clamd process')
             clamd_q['recv'].put('end')        # clamdプロセスに終わりを知らせる
-            clamd_q['send'].get(block=True)   # clamdプロセスが終わるのを待つ
+            print(clamd_q['send'].get(block=True))   # clamdプロセスが終わるのを待つ
 
         # メインループをもう一度回すかどうか
         if save:
@@ -817,4 +816,4 @@ def crawler_main():
 
 
 if __name__ == '__main__':
-    crawler_main()
+    crawler_host()
