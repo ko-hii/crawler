@@ -317,6 +317,7 @@ def reborn_child(host):
 
 
 # 残り数が負数を取ることが起き始めたので臨時に調整
+# print_progress内で、親から送るキューがemptyの場合、remainingを0にするので、そのあとにreceive()で'receive'を受け取って減算されるとなる？
 def adjust_remaining(host):
     url_tuple_list = list()
 
@@ -330,11 +331,14 @@ def adjust_remaining(host):
             url_tuple_list.append(temp)
 
     # 残り数を実際にカウント
-    hostName_remaining[host] = len(url_tuple_list)
+    ret = len(url_tuple_list)
+    hostName_remaining[host] = ret
 
     # 通信キューに戻す
     for url_tuple in url_tuple_list:
         hostName_queue[host]['parent_send'].put(url_tuple)
+
+    return ret
 
 
 # 5秒ごとに途中経過表示、メインループが動いてることの確認のため、スレッド化していない
@@ -350,8 +354,8 @@ def print_progress(run_time_pp, max_process, current_achievement):
             count += 1    # remainingが0のホスト数をカウント
         else:
             if remaining_temp < 0:
-                print('main : adjust remaining... , host= ' + host)
-                adjust_remaining(host)
+                print('main : adjust remaining... , host= ' + host + ' remaining= ' + str(remaining_temp))
+                remaining_temp = adjust_remaining(host)
             print('main : ' + host + "'s remaining is " + str(remaining_temp) +
                   '\t active = ' + str(hostName_process[host].is_alive()))
             if hostName_queue[host]['parent_send'].empty():  # 実際にキューの中を見て、空ならばremainingを0に
