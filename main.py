@@ -14,6 +14,7 @@ from clamd import clamd_main
 from shutil import copytree, copyfile
 from use_mysql import get_connector, make_tables, register_url
 import dbm
+import pickle
 
 
 necessary_list_dict = dict()   # 接続すべきURLかどうか判断するのに必要なリストをまとめた辞書
@@ -22,26 +23,24 @@ clamd_q = dict()
 machine_learning_q = dict()
 screenshots_svc_q = dict()
 
+# これらホスト名辞書はまとめてもいいが、まとめるとどこで何を使ってるか分かりにくくなる
 hostName_process = dict()      # ホスト名 : 子プロセス
-hostName_remaining = dict()    # ホスト名 : キューの残り
-hostName_pid = dict()          # ホスト名 : pid
-hostName_queue = dict()        # ホスト名 : キュー
+hostName_remaining = dict()    # ホスト名 : 待機URLのリスト
+hostName_queue = dict()        # ホスト名 : 通信キュー
 hostName_achievement = dict()  # ホスト名 : 達成数
-hostName_args = dict()         # ホスト名 : 子プロセスの引数   これらホスト名辞書はまとめてもいいが、まとめるとどこで使ってるか分かりにくくなる
+hostName_args = dict()         # ホスト名 : 子プロセスの引数
+fewest_host = None     # 待機URL数が一番少ないホスト名
 
-pid_time = dict()              # pid : (確認した時間, その時にキューに入っていた最初のURLのタプル)
+hostName_time = dict()         # ホスト名 : (確認した時間, その時にキューに入っていた最初のURLのタプル)
 thread_set = set()             # クローリングするURLかチェックするスレッドのid集合
 
-# notRitsumei_url = set()        # チェックスレッドによって、組織外だと判断されたURL集合
-# ritsumei_url = set()           # クローリングすると判断されたURL集合
-# black_url = set()              # 組織内だが、クローリングしないと判断されたURL集合
-url_db = None                  # 上記３つをまとめたkey-valueデータベース
-nth = None                       # 何回目のクローリングか
+url_db = None                  # key-valueデータベース. URL : (True or False or Black) + , +  nth
+nth = None                     # 何回目のクローリングか
 
 waiting_list = deque()         # (URL, リンク元)のタプルのリスト(受信したもの全て)
 url_list = deque()             # (URL, リンク元)のタプルのリスト(子プロセスに送信用)
-assignment_url = set()         # 割り当て済みのURLの集合
-remaining = 0
+assignment_url_set = set()     # 割り当て済みのURLの集合
+remaining = 0  # 途中保存で終わったときの残りURL数
 send_num = 0  # 途中経過で表示する5秒ごとの子プロセスに送ったURL数
 recv_num = 0  # 途中経過で表示する5秒ごとの子プロセスから受け取ったURL数
 all_achievement = 0
@@ -225,21 +224,23 @@ def init(first_time, setting_dict):    # 実行ディレクトリは「result」
         if not os.path.exists('result_' + str(first_time)):
             print('init : result_' + str(first_time) + 'that is the result of previous crawling is not found.')
             return False
-        data_temp = r_json('result_' + str(first_time) + '/all_achievement')   # 総達成数
+        # 総達成数
+        data_temp = r_json('result_' + str(first_time) + '/all_achievement')
         all_achievement = data_temp
-        data_temp = r_json('result_' + str(first_time) + '/assignment')   # 子プロセスに割り当てたURLの集合
-        assignment_url.update(set(data_temp))
-        # data_temp = r_json('result_' + str(first_time) + '/searching_url')  # クローリングするURLの集合(割り当てたかどうかは関係ない)
-        # ritsumei_url.update(set(data_temp))
-        # data_temp = r_json('result_' + str(first_time) + '/unsearching_url')  # クローリングしない(組織外だと判断された)URLの集合
-        # notRitsumei_url.update(set(data_temp))
-        # data_temp = r_json('result_' + str(first_time) + '/black_url')  # 組織内だがクローリングしないと判断されたURLの集合
-        # black_url.update(set(data_temp))
-        data_temp = r_json('result_' + str(first_time) + '/url_list')  # これから子プロセスに割り当てるURLの集合
-        url_list.extend([tuple(i) for i in data_temp])
-        assignment_url.difference_update(set([i[0] for i in url_list]))  # これから割り当てるので割り当て集合から削除する必要(割り当ての際にチェックされるため)
-        data_temp = r_json('result_' + str(first_time) + '/waiting_list')  # クローリングするかしないかのチェックをしていないURLの集合
+        # 子プロセスに割り当てたURLの集合
+        data_temp = r_json('result_' + str(first_time) + '/assignment_url_set')
+        assignment_url_set.update(set(data_temp))
+        # クローリングするかしないかのチェックをしていないURLの集合
+        data_temp = r_json('result_' + str(first_time) + '/waiting_list')
         waiting_list.extend([tuple(i) for i in data_temp])
+        # ホスト名を見て分類する前のリスト
+        data_temp = r_json('result_' + str(first_time) + '/url_list')
+        url_list.extend([tuple(i) for i in data_temp])
+        # 各ホストごとに分類されたURLのリストの辞書
+        with open('result_' + str(first_time) + '/host_remaining.pickle', 'rb') as f:
+            data_temp = pickle.load(f)
+        hostName_remaining.update(data_temp)
+
     # 作業ディレクトリを作って移動
     try:
         os.mkdir('result_' + str(first_time + 1))
@@ -299,79 +300,30 @@ def get_achievement_amount():
     return achievement
 
 
-# hostを担当しているプロセスへの通信キューからURLを一つ取り出し、url_listに加える
-# url_listに加えないと子プロセスは生成されない(通信キューに残っているだけじゃだめ)
-def reborn_child(host):
-    try:
-        url_tuple = hostName_queue[host]['parent_send'].get(block=False)
-    except Exception:
-        pass
-    else:
-        print('main : ' + host + ' is die, although queue is not empty. so append to url_list')
-        print('main : add ' + str(url_tuple))
-        hostName_remaining[host] -= 1
-        url_list.append(url_tuple)
-        assignment_url.discard(url_tuple[0])  # 送信URL集合から削除(送信時にチェックしているため)
-        return True
-    return False
-
-
-# 残り数が負数を取ることが起き始めたので臨時に調整
-# print_progress内で、親から送るキューがemptyの場合、remainingを0にするので、そのあとにreceive()で'receive'を受け取って減算されるとなる？
-def adjust_remaining(host):
-    url_tuple_list = list()
-
-    # 通信キューから取り出す
-    while True:
-        try:
-            temp = hostName_queue[host]['parent_send'].get(block=False)
-        except Exception:
-            break
-        else:
-            url_tuple_list.append(temp)
-
-    # 残り数を実際にカウント
-    ret = len(url_tuple_list)
-    hostName_remaining[host] = ret
-
-    # 通信キューに戻す
-    for url_tuple in url_tuple_list:
-        hostName_queue[host]['parent_send'].put(url_tuple)
-
-    return ret
-
-
 # 5秒ごとに途中経過表示、メインループが動いてることの確認のため、スレッド化していない
-def print_progress(run_time_pp, max_process, current_achievement):
+def print_progress(run_time_pp, current_achievement):
     global send_num, recv_num
     alive_count = get_alive_child_num()
     print('main : ---------progress--------')
 
     count = 0
-    alive_count_temp = alive_count
-    for host, remaining_temp in hostName_remaining.items():
-        if remaining_temp == 0:
-            count += 1    # remainingが0のホスト数をカウント
+    for host, remaining_list in hostName_remaining.items():
+        remaining_num = len(remaining_list['URL_list'])
+        if remaining_num == 0:
+            count += 1    # URL待機リストが空のホスト数をカウント
         else:
-            if remaining_temp < 0:
-                print('main : adjust remaining... , host= ' + host + ' remaining= ' + str(remaining_temp))
-                remaining_temp = adjust_remaining(host)
-            print('main : ' + host + "'s remaining is " + str(remaining_temp) +
-                  '\t active = ' + str(hostName_process[host].is_alive()))
-            if hostName_queue[host]['parent_send'].empty():  # 実際にキューの中を見て、空ならばremainingを0に
-                hostName_remaining[host] = 0
+            if host in hostName_process:
+                print('main : ' + host + "'s remaining is " + str(remaining_num) +
+                      '\t active = ' + str(hostName_process[host].is_alive()))
             else:
-                if alive_count_temp < max_process:
-                    # プロセスが死んでいて、キューにURLが残っている場合、通信キューから1つ取り出し、url_listに加える
-                    if not hostName_process[host].is_alive():
-                        if reborn_child(host=host):   # 通信キューからURLをurl_listに追加したら
-                            alive_count_temp += 1
+                print('main : ' + host + "'s remaining is " + str(remaining_num) + "\t active = isn't made")
     print('main : remaining=0 is ' + str(count))
     print('main : run time = ' + str(run_time_pp) + 's.')
-    print('main : URL / recv-num : send-num = ' + str(recv_num) + ' : ' + str(send_num))
-    print('main : achievement/assignment = ' + str(current_achievement) + ' / ' + str(len(assignment_url)))
+    print('main : recv-URL : send-URL = ' + str(recv_num) + ' : ' + str(send_num))
+    print('main : achievement/assignment = ' + str(current_achievement) + ' / ' + str(len(assignment_url_set)))
     print('main : all achievement = ' + str(all_achievement + current_achievement))
     print('main : alive child process = ' + str(alive_count))
+    print('main : remaining = ' + str(remaining))
     print('main : -------------------------')
     send_num = 0
     recv_num = 0
@@ -379,25 +331,17 @@ def print_progress(run_time_pp, max_process, current_achievement):
 
 # 強制終了させるために途中経過を保存する
 def forced_termination():
-    global remaining, all_achievement
+    global all_achievement
     print('main : forced_termination')
-    url_list_ft = list()
 
-    # 子に送信する用のキューからURLデータを抜き出し、end()がTrueを返すまで回り続ける
-    while end() is not True:
-        for queue in hostName_queue.values():
-            while True:
-                try:
-                    url_tuple = queue['parent_send'].get(block=False)  # 子に送信したURLのタプルを全て取り出す
-                except Exception:
-                    break
-                else:
-                    url_list_ft.append(url_tuple)   # 続きをする際にもう一度割り振るため、保存しておく
-        receive()   # 子プロセスからのデータを抜き取る
+    # 子プロセスがなくなるまで回り続ける
+    while get_alive_child_num() > 0:
+        receive_and_send(not_send=True)   # 子プロセスからのデータを抜き取る
         for host_name, host_name_remaining in hostName_remaining.items():
-            if host_name_remaining:
-                print('main : ' + host_name + ' : remaining --> ' + str(host_name_remaining))
-        print('main : alive process : ' + str(get_alive_child_num()))
+            length = len(host_name_remaining['URL_list'])
+            if length:
+                print('main : ' + host_name + ' : remaining --> ' + str(length))
+        print('main : wait for finishing alive process ' + str(get_alive_child_num()))
         del_child(int(time()))
         sleep(3)
 
@@ -410,29 +354,27 @@ def forced_termination():
 
     # 続きをするために途中経過を保存する
     all_achievement += get_achievement_amount()
-    url_list_ft.extend(url_list)
-    w_json(name='url_list', data=url_list_ft)
-    w_json(name='assignment', data=list(assignment_url))
-    # w_json(name='searching_url', data=list(ritsumei_url))
-    # w_json(name='unsearching_url', data=list(notRitsumei_url))
-    # w_json(name='black_url', data=list(black_url))
+    w_json(name='url_list', data=list(url_list))
+    w_json(name='assignment_url_set', data=list(assignment_url_set))
     w_json(name='all_achievement', data=all_achievement)
     w_json(name='waiting_list', data=list(waiting_list))
-    remaining = len(url_list_ft) + len(waiting_list)
+    with open('host_remaining.pickle', 'wb') as f:
+        pickle.dump(hostName_remaining, f)
 
 
-# 全てのキューに要素がなく、全ての子プロセスが終了していたらTrue
+# 全ての待機キューにURLがなく、全ての子プロセスが終了していたらTrue
 def end():
-    if get_alive_child_num():
-        # print('main : exist child process.')
+    if waiting_list:            # クローリングするURLかどうかのチェックを待っているURLがなくて
         return False
-    for host, q_e in hostName_queue.items():  # キューに要素があるかどうか
-        if not (q_e['child_send'].empty()):
-            print('main : child send queue is not empty.')
+    if url_list:                # 子プロセスに送るためのURLのリストが空で
+        return False
+    if thread_set:              # 立命館かどうかのチェックの最中のスレッドがなくて
+        return False
+    if get_alive_child_num():   # 生きている子プロセスがいなくて
+        return False
+    for host, remaining_temp in hostName_remaining.items():  # キューに要素があるかどうか
+        if len(remaining_temp['URL_list']):
             return False
-        if not (q_e['parent_send'].empty()):
-            return host
-
     return True
 
 
@@ -445,17 +387,12 @@ def make_url_list(now_time):
     for thread in thread_set:
         if type(thread.result) is not int:     # そのスレッドが最後まで実行されたか
             if thread.result is True:
-                # ritsumei_url.add(thread.url_tuple[0])   # 立命館URL集合に追加
-                url_db[thread.url_tuple[0]] = 'True,' + str(nth)
+                url_db[thread.url_tuple[0]] = 'True,' + str(nth)               # 立命館URL
                 url_list.append((thread.url_tuple[0], thread.url_tuple[1]))    # URLのタプルを検索リストに追加
             elif thread.result == 'black':
-                # black_url.add(thread.url_tuple[0])    # 立命館だがblackリストでフィルタリングされたURL集合
-                url_db[thread.url_tuple[0]] = 'Black,' + str(nth)
+                url_db[thread.url_tuple[0]] = 'Black,' + str(nth)  # 対象URLだがblackリストでフィルタリングされたURL
             else:   # (Falseか'unknown')
-                # notRitsumei_url.add(thread.url_tuple[0])
                 url_db[thread.url_tuple[0]] = 'False,' + str(nth)
-                #if thread.result is not False:
-                    #wa_file('get_addinfo_e.csv', thread.result)
                 # タプルの長さが3の場合はリダイレクト後のURL
                 # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
                 if len(thread.url_tuple) == 3:
@@ -480,7 +417,7 @@ def make_url_list(now_time):
 # クローリング対象のURLかどうかのチェックスレッドを起動する
 def thread_start(url_tuple):
     t = CheckSearchedUrlThread(url_tuple, int(time()), necessary_list_dict,)
-    t.setDaemon(True)   # メインはスレッドが生きていても死ぬことができる
+    t.setDaemon(True)   # daemonにすることで、メインスレッドはこのスレッドが生きていても死ぬことができる
     try:
         t.start()
     except RuntimeError:
@@ -489,15 +426,9 @@ def thread_start(url_tuple):
         thread_set.add(t)
 
 
-# urlのホスト名を返す。子プロセス数が上限ならFalseを返す。
-def choice_process(url_tuple, max_process, setting_dict, conn, n):
-    host_name = urlparse(url_tuple[0]).netloc
+# クローリングプロセスを生成する、既に一度作ったことがある場合は、プロセスだけ作る
+def make_process(host_name, setting_dict, conn, n):
     if host_name not in hostName_process:   # まだ作られていない場合、プロセス作成
-        # www.ritsumei.ac.jpは子プロセス数が上限でも常に回したい(一番多いから)
-        if not host_name == 'www.ritsumei.ac.jp':
-            if get_alive_child_num() >= max_process:
-                return False
-
         # 子プロセスと通信するキューを作成
         child_sendq = Queue()
         parent_sendq = Queue()
@@ -535,49 +466,60 @@ def choice_process(url_tuple, max_process, setting_dict, conn, n):
         # いろいろ保存
         hostName_process[host_name] = p
         hostName_queue[host_name] = {'child_send': child_sendq, 'parent_send': parent_sendq}
-        hostName_achievement[host_name] = 0
-        hostName_remaining[host_name] = 0
+        if host_name not in hostName_achievement:
+            hostName_achievement[host_name] = 0
         print('main : ' + host_name + " 's process start. " + 'pid = ' + str(p.pid))
-    elif not hostName_process[host_name].is_alive():  # 対象子プロセスが死んでいる場合は再作成
-        if not host_name == 'www.ritsumei.ac.jp':
-            if get_alive_child_num() >= max_process:
-                return False
+    else:
+        del hostName_process[host_name]
         print('main : ' + host_name + ' is not alive.')
         # プロセス作成
         p = Process(target=crawler_main, name=host_name, args=(hostName_args[host_name],))
         p.start()   # スタート
         hostName_process[host_name] = p   # プロセスを指す辞書だけ更新する
         print('main : ' + host_name + " 's process start. " + 'pid =' + str(p.pid))
-    return host_name
 
 
 # クローリング子プロセスの中で生きている数を返す
 def get_alive_child_num():
     count = 0
-    for temp in hostName_process.values():
-        if temp.is_alive():
+    for host_temp in hostName_process.values():
+        if host_temp.is_alive():
             count += 1
     return count
 
 
-# 子プロセスからの情報を受信する
+# 子プロセスからの情報を受信する、plzを受け取るとURLを送信する
 # 受信したリストの中のURLはwaiting_list(クローリングするURLかのチェック待ちリスト)に追加する。
-def receive():
+def receive_and_send(not_send=False):
     # 受信する型は、辞書、タプル、文字列の3種類
     # {'type': '文字列', 'url_tuple_list': [(url, src), (url, src),...]}の辞書
     # (url, 'redirect')のタプル(リダイレクトが起こったが、ホスト名が変わらなかったためそのまま処理された場合)
     # "receive"の文字(子プロセスがURLのタプルを受け取るたびに送信する)
-    global recv_num
+    # "plz"の文字(子プロセスがURLのタプルを要求)
+    global recv_num, send_num
     for host_name, queue in hostName_queue.items():
         try:
             received_data = queue['child_send'].get(block=False)
         except Exception:   # queueにデータがなければエラーが出る
             continue
-        if type(received_data) is str:          # 子プロセスが情報を受け取ったことの確認
-            hostName_remaining[host_name] -= 1   # キューに残っているURL数をデクリメント
+        if type(received_data) is str:       # 子プロセスが情報を受け取ったことの確認
+            if received_data == 'plz':     # URLの送信要求の場合
+                if not_send:
+                    queue['parent_send'].put('nothing')
+                else:
+                    if hostName_remaining[host_name]['URL_list']:
+                        # クローリングするurlを送信
+                        url_tuple = hostName_remaining[host_name]['URL_list'].popleft()
+                        hostName_remaining[host_name]['update_flag'] = True
+                        if url_tuple[0] not in assignment_url_set:  # 一度送ったURLは送らない
+                            assignment_url_set.add(url_tuple[0])
+                            queue['parent_send'].put(url_tuple)
+                            send_num += 1
+                    else:
+                        # もうURLが残ってないことを教える
+                        queue['parent_send'].put('nothing')
         elif type(received_data) is tuple:      # リダイレクトしたが、ホスト名が変わらなかったため子プロセスで処理を続行
-            assignment_url.add(received_data[0])  # リダイレクト後のURLを割り当てURL集合に追加
-            # ritsumei_url.add(received_data[0])    # 立命館URL集合にも追加
+            assignment_url_set.add(received_data[0])  # リダイレクト後のURLを割り当てURL集合に追加
             url_db[received_data[0]] = 'True,' + str(nth)
         elif type(received_data) is dict:
             if received_data['type'] == 'links':
@@ -591,7 +533,6 @@ def receive():
                     wa_file('../alert/new_window_url.csv', url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
             elif received_data['type'] == 'redirect':
                 url_tuple = received_data['url_tuple_list'][0]   # リダイレクトの場合、リストの要素数は１個だけ
-                # if url_tuple[0] in notRitsumei_url:  # 外部組織サーバへのリダイレクトならば
                 if url_tuple[0] in url_db:
                     value = url_db[url_tuple[0]].decode('utf-8')
                     value = value[0:value.find(',')]
@@ -610,12 +551,6 @@ def receive():
                 recv_num += len(url_tuple_list)
                 # リンク集から取り出してwaiting_listに追加。
                 for url_tuple in url_tuple_list:
-                    # if url_tuple[0] in notRitsumei_url:   # 既にチェック済みでクローリングしないURLと分かっているため
-                    #     pass
-                    # elif url_tuple[0] in black_url:       # ブラックリストに入っているため
-                    #     pass
-                    # elif url_tuple[0] in ritsumei_url:    # 既に割り当て済みで立命館
-                    #     pass
                     if url_tuple[0] not in url_db:
                         waiting_list.append(url_tuple)    # まだ対象URLかのチェックをしていないのでチェック待ちリストに入れる
                     else:
@@ -630,89 +565,73 @@ def receive():
                                 waiting_list.append(url_tuple)  # 前回はFalseだが、今回もう一度チェックする(ipアドレスの取得に失敗したものもFalseのため)
 
 
+def allocate_to_host_remaining(url_tuple):
+    host_name = urlparse(url_tuple[0]).netloc
+    if host_name not in hostName_remaining:
+        hostName_remaining[host_name] = dict()
+        hostName_remaining[host_name]['URL_list'] = deque()    # URLの待機リスト
+        hostName_remaining[host_name]['update_flag'] = False   # 待機リストからURLが取り出されたらTrue
+    hostName_remaining[host_name]['URL_list'].append(url_tuple)
+
+
+# hostName_processの整理(死んでいるプロセスのインスタンスを削除、queueの削除)
 # 子プロセスが終了しない、子のメインループも回ってなく、どこかで止まっている場合、親から強制終了させる
-# 基準は、親が子に送信する用のキューに同じデータが300秒以上入っているかどうか
+# 基準は、待機キューに同じデータが300秒以上入っているかどうか　としていたが、update_flagを作ったのでそれで判断
+# 通信キューにURLを溜めないようにしたので変更
 def del_child(now):
-    for process_dc in hostName_process.values():
-        pid_dc = process_dc.pid
+    del_process_list = list()
+    for host_name, process_dc in hostName_process.items():
         if process_dc.is_alive():
             print('main : alive process : ' + str(process_dc))
-            queue = hostName_queue[process_dc.name]
-            if pid_dc in pid_time:
-                time_dc = pid_time[pid_dc][0]
-                if (now - time_dc) > 300:
-                    print('main : ' + str(process_dc) + ' over 300 second')
-                    if queue['parent_send'].empty():                   # キューが空の場合-----------------------------
-                        if pid_time[pid_dc][1] is None:
-                            process_dc.terminate()           # キューがずっと空だったので終了させる
-                            print('main : ' + str(process_dc) + ' is deleted because it was alive over 300 second')
-                            wa_file('notice.txt', str(process_dc) + ' is deleted.\n')
-                            del pid_time[pid_dc]
-                        else:                     # 現在空だが、登録したときは空じゃなかったため、更新する
-                            print('main : ' + str(process_dc) + ' update dictionary')
-                            pid_time[pid_dc] = (now, None)
-                    else:                                                  # 現在、キューが空じゃない場合----------
-                        url_tuple_dc = list()
-                        while not(queue['parent_send'].empty()):                    # キューの情報を全て抜き取り
-                            try:
-                                url_tuple_dc.append(queue['parent_send'].get(block=False))
-                            except Exception:
-                                break
-                        if not url_tuple_dc:
-                            pid_time[pid_dc] = (now, None)
-                            continue
-                        if pid_time[pid_dc][1] == url_tuple_dc[0]:          # 一つ目が同じか比較
-                            process_dc.terminate()                          # 同じの場合、プロセスを終了させる
-                            print('main : ' + str(process_dc) + ' is deleted due to 300 second. no empty.')
-                            wa_file('notice.txt', str(process_dc) + ' is deleted.\n')
-                            del pid_time[pid_dc]
-                        else:                                              # 違った場合、辞書を更新
-                            print('main : ' + str(process_dc) + ' update dictionary')
-                            pid_time[pid_dc] = (now, url_tuple_dc[0])
-                        for i in url_tuple_dc:                             # 抜き取ったキューは元に戻す
-                            queue['parent_send'].put(i)
-                else:                                          # 300秒たっていない場合
-                    if queue['parent_send'].empty():
-                        if not(pid_time[pid_dc][1] is None):
-                            pid_time[pid_dc] = (now, None)
-                    else:
-                        url_tuple_dc = list()
-                        try:
-                            url_tuple_dc.append(queue['parent_send'].get(block=False))
-                        except Exception:
-                            pid_time[pid_dc] = (now, None)
-                            continue
-                        if not(pid_time[pid_dc][1] == url_tuple_dc[0]):
-                            pid_time[pid_dc] = (now, url_tuple_dc[0])
-                        while not (queue['parent_send'].empty()):
-                            try:
-                                url_tuple_dc.append(queue['parent_send'].get(block=False))
-                            except Exception:
-                                break
-                        for i in url_tuple_dc:
-                            queue['parent_send'].put(i)
-            else:
-                if queue['parent_send'].empty():
-                    pid_time[pid_dc] = (now, None)
-                else:
-                    url_tuple_dc = list()
-                    try:
-                        url_tuple_dc.append(queue['parent_send'].get(block=False))
-                        pid_time[pid_dc] = (now, url_tuple_dc[0])
-                    except Exception:
-                        pid_time[pid_dc] = (now, None)
-                    while not(queue['parent_send'].empty()):
-                        try:
-                            url_tuple_dc.append(queue['parent_send'].get(block=False))
-                        except Exception:
-                            break
-                    for i in url_tuple_dc:
-                        queue['parent_send'].put(i)
-        else:
-            try:
-                del pid_time[pid_dc]
-            except KeyError:
-                pass
+            # remaining_dc = hostName_remaining[host_name]['URL_list']
+            if host_name in hostName_time:
+                if (now - hostName_time[host_name]) > 300:   # 300秒経っていた場合
+                    process_dc.terminate()  # 300秒ずっと待機URLリストが変化なかったので終了させる
+                    del hostName_time[host_name]
+                    print('main : terminate ' + str(process_dc) + ' because it was alive over 300 second')
+                    wa_file('notice.txt', str(process_dc) + ' is deleted.\n')
+                else:   # 300秒経っていない場合、remainingリストからURLが取り出されていたら、時間を更新
+                    if hostName_remaining[host_name]['update_flag']:
+                        hostName_time[host_name] = now
+                        hostName_remaining[host_name]['update_flag'] = False
+                    # if remaining_dc:
+                    #     hostName_remaining[host_name]['update_flag'] = False
+                    #     if hostName_time[host_name][1] != remaining_dc[0]:
+                    #         hostName_time[host_name] = (now, remaining_dc[0])
+                    # else:
+                    #     if hostName_time[host_name][1] is not None:
+                    #         hostName_time[host_name] = (now, None)
+                    #     elif hostName_remaining[host_name]['update_flag']:
+                    #         hostName_time[host_name] = (now, None)
+                    #         hostName_remaining[host_name]['update_flag'] = False
+            else:   # 時間を登録
+                hostName_time[host_name] = now
+                hostName_remaining[host_name]['update_flag'] = False
+                # if remaining_dc:
+                #     hostName_time[host_name] = (now, remaining_dc[0])
+                # else:
+                #     hostName_time[host_name] = (now, None)
+            # 通信路が空だった最後の時間をリセット
+            if 'latest_time' in hostName_queue[host_name]:
+                del hostName_queue[host_name]['latest_time']
+        else:  # プロセスが死んでいれば
+            if host_name in hostName_time:
+                del hostName_time[host_name]
+            # 死んでいて、かつ通信路が空ならば、そのときの時間を保存
+            if 'latest_time' not in hostName_queue[host_name]:
+                if hostName_queue[host_name]['child_send'].empty() and hostName_queue[host_name]['parent_send'].empty():
+                    hostName_queue[host_name]['latest_time'] = now
+
+        # 死んでいたプロセスのインスタンスを削除(資源解放のため)
+        # 基準は死んでいるプロセスで、かつ通信路が60秒以上空の場合
+        if 'latest_time' in hostName_queue[host_name]:
+            if now - hostName_queue[host_name]['latest_time'] > 60:
+                del_process_list.append(host_name)
+    # メモリ解放
+    for host_name in del_process_list:
+        del hostName_args[host_name]
+        del hostName_process[host_name]
+        del hostName_queue[host_name]
 
 
 def crawler_host(n=None):
@@ -724,9 +643,8 @@ def crawler_host(n=None):
     if n is None:
         os._exit(255)
     nth = n
-    global hostName_achievement, hostName_pid, hostName_process, hostName_queue, hostName_remaining, pid_time
-    # global notRitsumei_url, ritsumei_url, black_url
-    global waiting_list, url_list, assignment_url, thread_set
+    global hostName_achievement, hostName_process, hostName_queue, hostName_remaining, hostName_time, fewest_host
+    global waiting_list, url_list, assignment_url_set, thread_set
     global remaining, send_num, recv_num, all_achievement
     start = int(time())
 
@@ -792,18 +710,15 @@ def crawler_host(n=None):
         send_num = 0                     # 途中経過で表示する5秒ごとの子プロセスに送ったURL数
         recv_num = 0                     # 途中経過で表示する5秒ごとの子プロセスから受け取ったURL数
         hostName_process = dict()        # ホスト名 : 子プロセス
-        hostName_remaining = dict()      # ホスト名 : キューの残り
-        hostName_pid = dict()            # ホスト名 : pid
+        hostName_remaining = dict()      # ホスト名 : 待機URLのキュー
         hostName_queue = dict()          # ホスト名 : キュー
         hostName_achievement = dict()    # ホスト名 : 達成数
-        pid_time = dict()                # pid : (確認した時間, その時にキューに入っていた最初のURLのタプル)
+        hostName_time = dict()           # ホスト名 : (確認した時間, その時にキューに入っていた最初のURLのタプル)
+        fewest_host = None
         thread_set = set()               # クローリングするURLかチェックするスレッドのid集合
-        # notRitsumei_url = set()          # チェックスレッドによって、組織外だと判断されたURL集合
-        # ritsumei_url = set()             # クローリングすると判断されたURL集合
-        # black_url = set()                # 組織内だが、クローリングしないと判断されたURL集合
         waiting_list = deque()           # (URL, リンク元)のタプルのリスト(クローリングするURLかチェック待ちのリスト)
         url_list = deque()               # (URL, リンク元)のタプルのリスト(子プロセスに送信用)
-        assignment_url = set()           # 割り当て済みのURLの集合
+        assignment_url_set = set()           # 割り当て済みのURLの集合
         all_achievement = 0
         current_start_time = int(time())
         pre_time = current_start_time
@@ -814,13 +729,14 @@ def crawler_host(n=None):
         # メインループ
         while True:
             current_achievement = get_achievement_amount()
-            receive()
+            remaining = len(url_list) + len(waiting_list) + sum([len(dic['URL_list']) for dic in hostName_remaining.values()])
+            receive_and_send()
             now = int(time())
 
             # 途中経過表示
             if now - pre_time >= 5:
                 del_child(now)
-                print_progress(now - current_start_time, max_process, current_achievement)
+                print_progress(now - current_start_time, current_achievement)
                 pre_time = now
 
             # 以下、一気に回すと時間がかかるので、途中保存をして止めたい場合
@@ -829,14 +745,13 @@ def crawler_host(n=None):
                     forced_termination()
                     break
             if assign_or_achievement:  # 指定数URLを達成したら
-                if len(assignment_url) >= max_page:
+                if len(assignment_url_set) >= max_page:
                     print('num of assignment reached MAX')
                     while not (get_alive_child_num() == 0):
                         sleep(3)
                         for temp in hostName_process.values():
                             if temp.is_alive():
                                 print(temp)
-                                current_achievement = get_achievement_amount()
                     break
             else:   # 指定数URLをアサインしたら
                 if (all_achievement + current_achievement) >= max_page:
@@ -852,19 +767,13 @@ def crawler_host(n=None):
                     break
 
             # 本当の終了条件
-            if not waiting_list:   # クローリングするURLかどうかのチェックを待っているURLがなくて
-                if not url_list:   # 子プロセスに送るためのURLのリストが空で
-                    if not thread_set:  # 立命館かどうかのチェックの最中のスレッドがない場合、end()を呼び出す
-                        end_flag = end()
-                        if end_flag is True:
-                            all_achievement += current_achievement
-                            w_json(name='assignment', data=list(assignment_url))
-                            break
-                        elif end_flag is False:
-                            continue
-                        else:
-                            reborn_child(end_flag)  # 親が送信したURLがキューに残っている場合
-            else:
+            if end():
+                all_achievement += current_achievement
+                w_json(name='assignment_url_set', data=list(assignment_url_set))
+                break
+
+            # 組織内URLかチェックする待ちリストからpop
+            if waiting_list:
                 if active_count() < 2000:
                     url_tuple = waiting_list.popleft()    # クローリングするURLかどうかのチェック待ちリストからpop
                     try:
@@ -878,58 +787,65 @@ def crawler_host(n=None):
             # クローリングするURLかどうかのチェックが終わったものからurl_listに追加する
             make_url_list(now)
 
-            # url_list(子プロセスに送るURLのタプルのリスト)が空じゃなければ取り出す
-            if not url_list:
-                continue
-            else:
+            # url_list(子プロセスに送るURLのタプルのリスト)からURLのタプルを取り出す
+            if url_list:
                 url_tuple = url_list.popleft()
-            if url_tuple[0] in assignment_url:    # 滅多にないが同じものが送られていることがある気がする
-                wa_file('assign.txt', url_tuple[0] + '\n')
-                continue
+                # ホスト名ごとに分けられている子プロセスに送信待ちリストに追加
+                allocate_to_host_remaining(url_tuple=url_tuple)
 
-            # URLのホスト名から、それを担当しているプロセスがなければ(死んでいれば)生成。
-            host_name = choice_process(url_tuple, max_process, setting_dict, conn, n)
-            if host_name is False:
-                url_list.append(url_tuple)  # Falseが返ってくると子プロセス数が上限なので、url_listに戻す
-                continue
-
-            # 子プロセスにURLのタプルを送信
-            q_to_child = hostName_queue[host_name]['parent_send']  # そのサーバを担当しているプロセスに送るキューをゲット
-            if not q_to_child.full():
-                if mysql:
-                    register_url(conn=conn, url=url_tuple[0], n=n)  # データベースにurlを登録する
-                q_to_child.put(url_tuple)
-                hostName_remaining[host_name] += 1
-                assignment_url.add(url_tuple[0])
-                send_num += 1
-            else:
-                print('main : ' + host_name + ' queue is full')
-                url_list.append(url_tuple)
+            # プロセス数が上限に達していなければ、プロセスを生成する
+            num_of_process = max_process - get_alive_child_num()
+            if num_of_process > 0:
+                # remainingリストの中で一番待機URL数が多い順プロセスを生成する
+                tmp_list = sorted(hostName_remaining.items(), reverse=True, key=lambda tup: len(tup[1]['URL_list']))
+                tmp_list = [tmp for tmp in tmp_list if tmp[1]['URL_list']]
+                # 一番待機URLが少ないプロセスを1つ作る
+                fewest = tmp_list[-1][0]
+                if fewest_host is None:
+                    make_process(fewest, setting_dict, conn, n)
+                    num_of_process -= 1
+                    fewest_host = fewest
+                else:
+                    if fewest_host in hostName_process:
+                        if hostName_process[fewest_host].is_alive():
+                            pass
+                        else:
+                            make_process(fewest, setting_dict, conn, n)
+                            num_of_process -= 1
+                            fewest_host = fewest
+                # 多い順に作る
+                for host_url_list_tuple in tmp_list:
+                    if num_of_process <= 0:
+                        break
+                    host = host_url_list_tuple[0]
+                    if host_url_list_tuple[1]['URL_list']:  # remainingに待機URLがあれば
+                        if host in hostName_process:
+                            if hostName_process[host].is_alive():
+                                continue   # プロセスが活動中なら、次に多いホストを
+                        make_process(host, setting_dict, conn, n)
+                        num_of_process -= 1
 
         # メインループを抜け、結果表示＆保存
+        remaining = len(url_list) + len(waiting_list) + sum([len(di['URL_list']) for di in hostName_remaining.values()])
+        current_achievement = get_achievement_amount()
         print('\nmain : -------------result------------------')
-        print('main : assignment_url = ' + str(len(assignment_url)))
+        print('main : assignment_url_set = ' + str(len(assignment_url_set)))
         print('main : current achievement = ' + str(current_achievement))
         print('main : all achievement = ' + str(all_achievement))
-        print('main : number of child-process = ' + str(len(hostName_process)))
+        print('main : number of child-process = ' + str(len(hostName_achievement)))
         run_time = int(time()) - current_start_time
         print('run time = ' + str(run_time))
         print('remaining = ' + str(remaining))
-        wa_file('result.txt', 'assignment_url = ' + str(len(assignment_url)) + '\n' +
+        wa_file('result.txt', 'assignment_url_set = ' + str(len(assignment_url_set)) + '\n' +
                 'current achievement = ' + str(current_achievement) + '\n' +
                 'all achievement = ' + str(all_achievement) + '\n' +
-                'number of child-process = ' + str(len(hostName_process)) + '\n' +
+                'number of child-process = ' + str(len(hostName_achievement)) + '\n' +
                 'run time = ' + str(run_time) + '\n' +
                 'remaining = ' + str(remaining) + '\n' +
                 'date = ' + str(date.today()) + '\n')
 
         print('main : save...')   # 途中結果を保存する
-        os.mkdir('TEMP')
-        copytree('../../RAD/df_dict', 'TEMP/df_dict')
-        copytree('../../RAD/tag_data', 'TEMP/tag_data')
-        copytree('../../RAD/url_hash_json', 'TEMP/url_hash_json')
-        copytree('../../RAD/temp', 'TEMP/temp')
-        copytree('../alert', 'TEMP/alert')
+        copytree('../../RAD', 'TEMP')
         print('main : save done')
 
         if setting_dict['machine_learning']:
