@@ -44,6 +44,7 @@ remaining = 0  # 途中保存で終わったときの残りURL数
 send_num = 0  # 途中経過で表示する5秒ごとの子プロセスに送ったURL数
 recv_num = 0  # 途中経過で表示する5秒ごとの子プロセスから受け取ったURL数
 all_achievement = 0
+cant_del_child_set = set()   # 子プロセスがsave中なので、del_child()で消してほしくないプロセスの集合
 
 
 # 設定ファイルの読み込み
@@ -169,7 +170,7 @@ def import_file(path):             # 実行でディレクトリは「crawler」
     else:
         necessary_list_dict['IPAddress_list'] = list()
 
-    # 空文字が入っている場合は削除(急にBLACK_LISTに空文字が入るようになってしまった)
+    # 空文字が入っている場合は削除(改行で分けているため、空行があれば空文字が入る)
     for v in necessary_list_dict.values():
         if '' in v:
             v.remove('')
@@ -178,6 +179,9 @@ def import_file(path):             # 実行でディレクトリは「crawler」
         data_temp = r_file(path + '/REDIRECT_LIST.txt')
         if data_temp:
             after_redirect_list = data_temp.split('\n')
+            # 空文字が入る場合は削除
+            if '' in after_redirect_list:
+                after_redirect_list.remove('')
 
 
 # 必要なディレクトリを作成
@@ -394,15 +398,15 @@ def make_url_list(now_time):
             else:   # (Falseか'unknown')
                 url_db[thread.url_tuple[0]] = 'False,' + str(nth)
                 # タプルの長さが3の場合はリダイレクト後のURL
-                # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
                 if len(thread.url_tuple) == 3:
-                    host_name = urlparse(thread.url_tuple[0]).netloc
-                    if not [white for white in after_redirect_list if host_name.endswith(white)]:
+                    redirect_host = urlparse(thread.url_tuple[0]).netloc
+                    # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
+                    if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
                         wa_file('../alert/after_redirect_check.csv',
                                 thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
-                    else:
-                        wa_file('after_redirect.csv',
-                                thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
+                    # 一応すべて外部出力
+                    wa_file('after_redirect.csv',
+                            thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
             del_list.append(thread)
             thread.lock.release()    # スレッドは最後にロックをして待っているのでリリースして終わらせる
         else:
@@ -518,6 +522,16 @@ def receive_and_send(not_send=False):
                     else:
                         # もうURLが残ってないことを教える
                         queue['parent_send'].put('nothing')
+            # elif received_data == 'save':   # save と done_save が逆順で来る可能性がある？
+            #     if host_name in cant_del_child_set:
+            #         cant_del_child_set.remove(host_name)
+            #     else:
+            #         cant_del_child_set.add(host_name)
+            # elif received_data == 'done_save':
+            #     if host_name in cant_del_child_set:   # 要素のチェックをしないとremoveでエラー落ちしていた
+            #         cant_del_child_set.remove(host_name)
+            #     else:
+            #         cant_del_child_set.add(host_name)
         elif type(received_data) is tuple:      # リダイレクトしたが、ホスト名が変わらなかったため子プロセスで処理を続行
             assignment_url_set.add(received_data[0])  # リダイレクト後のURLを割り当てURL集合に追加
             url_db[received_data[0]] = 'True,' + str(nth)
@@ -537,13 +551,12 @@ def receive_and_send(not_send=False):
                     value = url_db[url_tuple[0]].decode('utf-8')
                     value = value[0:value.find(',')]
                     if value == 'False':
-                        host_name = urlparse(url_tuple[0]).netloc
-                        if not [white for white in after_redirect_list if host_name.endswith(white)]:
+                        redirect_host = urlparse(url_tuple[0]).netloc
+                        if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
                             wa_file('../alert/after_redirect_check.csv',
                                     url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
-                        else:
-                            wa_file('after_redirect.csv',
-                                    url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
+                        wa_file('after_redirect.csv',
+                                url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
 
             # waitingリストに追加。既に割り当て済みの場合は追加しない。
             url_tuple_list = received_data['url_tuple_list']
@@ -583,9 +596,11 @@ def del_child(now):
     for host_name, process_dc in hostName_process.items():
         if process_dc.is_alive():
             print('main : alive process : ' + str(process_dc))
-            # remaining_dc = hostName_remaining[host_name]['URL_list']
             if host_name in hostName_time:
                 if (now - hostName_time[host_name]) > 300:   # 300秒経っていた場合
+                    # if host_name in cant_del_child_set:
+                    #     wa_file('notice.txt', str(process_dc) + " is couldn't deleted.\n")
+                    # else:
                     process_dc.terminate()  # 300秒ずっと待機URLリストが変化なかったので終了させる
                     del hostName_time[host_name]
                     print('main : terminate ' + str(process_dc) + ' because it was alive over 300 second')
@@ -594,23 +609,9 @@ def del_child(now):
                     if hostName_remaining[host_name]['update_flag']:
                         hostName_time[host_name] = now
                         hostName_remaining[host_name]['update_flag'] = False
-                    # if remaining_dc:
-                    #     hostName_remaining[host_name]['update_flag'] = False
-                    #     if hostName_time[host_name][1] != remaining_dc[0]:
-                    #         hostName_time[host_name] = (now, remaining_dc[0])
-                    # else:
-                    #     if hostName_time[host_name][1] is not None:
-                    #         hostName_time[host_name] = (now, None)
-                    #     elif hostName_remaining[host_name]['update_flag']:
-                    #         hostName_time[host_name] = (now, None)
-                    #         hostName_remaining[host_name]['update_flag'] = False
             else:   # 時間を登録
                 hostName_time[host_name] = now
                 hostName_remaining[host_name]['update_flag'] = False
-                # if remaining_dc:
-                #     hostName_time[host_name] = (now, remaining_dc[0])
-                # else:
-                #     hostName_time[host_name] = (now, None)
             # 通信路が空だった最後の時間をリセット
             if 'latest_time' in hostName_queue[host_name]:
                 del hostName_queue[host_name]['latest_time']
@@ -787,8 +788,8 @@ def crawler_host(n=None):
             # クローリングするURLかどうかのチェックが終わったものからurl_listに追加する
             make_url_list(now)
 
-            # url_list(子プロセスに送るURLのタプルのリスト)からURLのタプルを取り出す
-            if url_list:
+            # url_list(子プロセスに送るURLのタプルのリスト)からURLのタプルを取り出して分類する
+            while url_list:
                 url_tuple = url_list.popleft()
                 # ホスト名ごとに分けられている子プロセスに送信待ちリストに追加
                 allocate_to_host_remaining(url_tuple=url_tuple)
@@ -798,32 +799,33 @@ def crawler_host(n=None):
             if num_of_process > 0:
                 # remainingリストの中で一番待機URL数が多い順プロセスを生成する
                 tmp_list = sorted(hostName_remaining.items(), reverse=True, key=lambda tup: len(tup[1]['URL_list']))
-                tmp_list = [tmp for tmp in tmp_list if tmp[1]['URL_list']]
-                # 一番待機URLが少ないプロセスを1つ作る
-                fewest = tmp_list[-1][0]
-                if fewest_host is None:
-                    make_process(fewest, setting_dict, conn, n)
-                    num_of_process -= 1
-                    fewest_host = fewest
-                else:
-                    if fewest_host in hostName_process:
-                        if hostName_process[fewest_host].is_alive():
-                            pass
-                        else:
-                            make_process(fewest, setting_dict, conn, n)
-                            num_of_process -= 1
-                            fewest_host = fewest
-                # 多い順に作る
-                for host_url_list_tuple in tmp_list:
-                    if num_of_process <= 0:
-                        break
-                    host = host_url_list_tuple[0]
-                    if host_url_list_tuple[1]['URL_list']:  # remainingに待機URLがあれば
-                        if host in hostName_process:
-                            if hostName_process[host].is_alive():
-                                continue   # プロセスが活動中なら、次に多いホストを
-                        make_process(host, setting_dict, conn, n)
+                tmp_list = [tmp for tmp in tmp_list if tmp[1]['URL_list']]   # 待機が0は消す
+                if tmp_list:
+                    # 一番待機URLが少ないプロセスを1つ作る
+                    fewest = tmp_list[-1][0]
+                    if fewest_host is None:
+                        make_process(fewest, setting_dict, conn, n)
                         num_of_process -= 1
+                        fewest_host = fewest
+                    else:
+                        if fewest_host in hostName_process:
+                            if hostName_process[fewest_host].is_alive():
+                                pass
+                            else:
+                                make_process(fewest, setting_dict, conn, n)
+                                num_of_process -= 1
+                                fewest_host = fewest
+                    # 多い順に作る
+                    for host_url_list_tuple in tmp_list:
+                        if num_of_process <= 0:
+                            break
+                        host = host_url_list_tuple[0]
+                        if host_url_list_tuple[1]['URL_list']:  # remainingに待機URLがあれば
+                            if host in hostName_process:
+                                if hostName_process[host].is_alive():
+                                    continue   # プロセスが活動中なら、次に多いホストを
+                            make_process(host, setting_dict, conn, n)
+                            num_of_process -= 1
 
         # メインループを抜け、結果表示＆保存
         remaining = len(url_list) + len(waiting_list) + sum([len(di['URL_list']) for di in hostName_remaining.values()])
