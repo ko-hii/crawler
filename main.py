@@ -12,9 +12,10 @@ from datetime import date
 # from machine_learning_tag import machine_learning_main
 from clamd import clamd_main
 from shutil import copytree, copyfile
-from use_mysql import get_connector, make_tables, register_url
+from use_mysql import get_connector, make_tables
 import dbm
 import pickle
+from summarize_alert import summarize_alert_main
 
 
 necessary_list_dict = dict()   # 接続すべきURLかどうか判断するのに必要なリストをまとめた辞書
@@ -22,6 +23,7 @@ after_redirect_list = list()   # リダイレクト後、ジャンプ先ホス�
 clamd_q = dict()
 machine_learning_q = dict()
 screenshots_svc_q = dict()
+summarize_alert_q = dict()
 
 # これらホスト名辞書はまとめてもいいが、まとめるとどこで何を使ってるか分かりにくくなる
 hostName_process = dict()      # ホスト名 : 子プロセス
@@ -199,8 +201,8 @@ def make_dir(screenshots):          # 実行ディレクトリは「crawler」
         os.mkdir('RAD/temp')
     if not os.path.exists('result'):
         os.mkdir('result')
-    if not os.path.exists('result/alert'):
-        os.mkdir('result/alert')
+    # if not os.path.exists('result/alert'):
+    #     os.mkdir('result/alert')
 
     if screenshots:
         if not os.path.exists('RAD/screenshots'):
@@ -252,8 +254,17 @@ def init(first_time, setting_dict):    # 実行ディレクトリは「result」
     except FileExistsError:
         print('init : result_' + str(first_time + 1) + ' directory has already made.')
         return False
+    # summarize_alertのプロセスを起動
+    recvq = Queue()
+    sendq = Queue()
+    summarize_alert_q['recv'] = recvq  # 子プロセスが受け取る用のキュー
+    summarize_alert_q['send'] = sendq  # 子プロセスから送信する用のキュー
+    p = Process(target=summarize_alert_main, args=(recvq, sendq, nth))
+    p.start()
+    summarize_alert_q['process'] = p
+
+    # clamdを使うためのプロセスを起動(その子プロセスでclamdを起動)
     if clamd_scan:
-        # clamdを使うためのプロセスを起動(その子プロセスでclamdを起動)
         recvq = Queue()
         sendq = Queue()
         clamd_q['recv'] = recvq   # clamdプロセスが受け取る用のキュー
@@ -399,11 +410,31 @@ def make_url_list(now_time):
                 url_db[thread.url_tuple[0]] = 'False,' + str(nth)
                 # タプルの長さが3の場合はリダイレクト後のURL
                 if len(thread.url_tuple) == 3:
+                    w_alert_flag = True
                     redirect_host = urlparse(thread.url_tuple[0]).netloc
+                    redirect_path = urlparse(thread.url_tuple[0]).path
                     # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
-                    if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
-                        wa_file('../alert/after_redirect_check.csv',
-                                thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
+                    # if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
+                    # ホスト名+パスの途中 までを見ることにしたので、上記の一行では判断できなくなった
+                    for white_redirect_url in after_redirect_list:
+                        if '+' in white_redirect_url:
+                            white_host = white_redirect_url[0:white_redirect_url.find('+')]
+                            white_path = white_redirect_url[white_redirect_url.find('+')+1:]
+                        else:
+                            white_host = white_redirect_url
+                            white_path = ''
+                        if redirect_host.endswith(white_host) and redirect_path.startswith(white_path):
+                            w_alert_flag = False
+                    if w_alert_flag:
+                        data_temp = dict()
+                        data_temp['url'] = thread.url_tuple[0]
+                        data_temp['src'] = thread.url_tuple[1]
+                        data_temp['file_name'] = 'after_redirect_check.csv'
+                        data_temp['content'] = thread.url_tuple[2] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[0]
+                        data_temp['label'] = 'URL,SOURCE,REDIRECT_URL'
+                        summarize_alert_q['recv'].put(data_temp)
+                        # wa_file('../alert/after_redirect_check.csv',
+                        #         thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
                     # 一応すべて外部出力
                     wa_file('after_redirect.csv',
                             thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
@@ -442,6 +473,7 @@ def make_process(host_name, setting_dict, conn, n):
         args_dic['host_name'] = host_name
         args_dic['parent_sendq'] = parent_sendq
         args_dic['child_sendq'] = child_sendq
+        args_dic['alert_process_q'] = summarize_alert_q['recv']
         if setting_dict['clamd_scan']:
             args_dic['clamd_q'] = clamd_q['recv']
         else:
@@ -522,16 +554,6 @@ def receive_and_send(not_send=False):
                     else:
                         # もうURLが残ってないことを教える
                         queue['parent_send'].put('nothing')
-            # elif received_data == 'save':   # save と done_save が逆順で来る可能性がある？
-            #     if host_name in cant_del_child_set:
-            #         cant_del_child_set.remove(host_name)
-            #     else:
-            #         cant_del_child_set.add(host_name)
-            # elif received_data == 'done_save':
-            #     if host_name in cant_del_child_set:   # 要素のチェックをしないとremoveでエラー落ちしていた
-            #         cant_del_child_set.remove(host_name)
-            #     else:
-            #         cant_del_child_set.add(host_name)
         elif type(received_data) is tuple:      # リダイレクトしたが、ホスト名が変わらなかったため子プロセスで処理を続行
             assignment_url_set.add(received_data[0])  # リダイレクト後のURLを割り当てURL集合に追加
             url_db[received_data[0]] = 'True,' + str(nth)
@@ -544,7 +566,14 @@ def receive_and_send(not_send=False):
             elif received_data['type'] == 'new_window_url':      # 新しい窓(orタブ)に出たURL(今のところ見つかってない)
                 url_tuple_list = received_data['url_tuple_list']
                 for url_tuple in url_tuple_list:
-                    wa_file('../alert/new_window_url.csv', url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
+                    data_temp = dict()
+                    data_temp['url'] = url_tuple[0]
+                    data_temp['src'] = url_tuple[1]
+                    data_temp['file_name'] = 'new_window_url.csv'
+                    data_temp['content'] = url_tuple[0] + ',' + url_tuple[1]
+                    data_temp['label'] = 'NEW_WINDOW_URL,URL'
+                    summarize_alert_q['recv'].put(data_temp)
+                    # wa_file('../alert/new_window_url.csv', url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
             elif received_data['type'] == 'redirect':
                 url_tuple = received_data['url_tuple_list'][0]   # リダイレクトの場合、リストの要素数は１個だけ
                 if url_tuple[0] in url_db:
@@ -553,10 +582,17 @@ def receive_and_send(not_send=False):
                     if value == 'False':
                         redirect_host = urlparse(url_tuple[0]).netloc
                         if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
-                            wa_file('../alert/after_redirect_check.csv',
-                                    url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
+                            data_temp = dict()
+                            data_temp['url'] = url_tuple[0]
+                            data_temp['src'] = url_tuple[1]
+                            data_temp['file_name'] = 'after_redirect_check.csv'
+                            data_temp['content'] = url_tuple[2] + ',' + url_tuple[1] + ',' + url_tuple[0]
+                            data_temp['label'] = 'URL,SOURCE,REDIRECT_URL'
+                            summarize_alert_q['recv'].put(data_temp)
+                            # wa_file('../alert/after_redirect_check.csv',
+                            #         url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
                         wa_file('after_redirect.csv',
-                                url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
+                                url_tuple[2] + ',' + url_tuple[1] + ',' + url_tuple[0] + '\n')
 
             # waitingリストに追加。既に割り当て済みの場合は追加しない。
             url_tuple_list = received_data['url_tuple_list']
@@ -865,6 +901,10 @@ def crawler_host(n=None):
             clamd_q['recv'].put('end')        # clamdプロセスに終わりを知らせる
             if not clamd_q['process'].join(timeout=60):   # clamdプロセスが終わるのを待つ
                 clamd_q['process'].terminate()
+        print('wait for summarize alert process')
+        summarize_alert_q['recv'].put('end')  # summarize alertプロセスに終わりを知らせる
+        if not summarize_alert_q['process'].join(timeout=60):  # summarize alertプロセスが終わるのを待つ
+            summarize_alert_q['process'].terminate()
 
         url_db.close()
         # メインループをもう一度回すかどうか
