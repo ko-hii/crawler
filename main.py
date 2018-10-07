@@ -3,7 +3,7 @@ from urllib.parse import urlparse
 from collections import deque
 from time import time, sleep
 from crawler3 import crawler_main
-from file_rw import wa_file, r_file, w_json, r_json
+from file_rw import r_file, w_json, r_json, w_file
 from check_searched_url import CheckSearchedUrlThread
 from threading import active_count
 import os
@@ -12,10 +12,11 @@ from datetime import date
 # from machine_learning_tag import machine_learning_main
 from clamd import clamd_main
 from shutil import copytree, copyfile
-from use_mysql import get_connector, make_tables
 import dbm
 import pickle
 from summarize_alert import summarize_alert_main
+from sys_command import kill_chrome
+from memory_observer import MemoryObserverThread
 
 
 necessary_list_dict = dict()   # 接続すべきURLかどうか判断するのに必要なリストをまとめた辞書
@@ -52,8 +53,8 @@ cant_del_child_set = set()   # 子プロセスがsave中なので、del_child()�
 # 設定ファイルの読み込み
 def get_setting_dict(path):
     setting = dict()
-    bool_variable_list = ['assignOrAchievement', 'screenshots', 'clamd_scan', 'machine_learning', 'phantomjs', 'mecab',
-                          'mysql', 'screenshots_svc']
+    bool_variable_list = ['assignOrAchievement', 'screenshots', 'clamd_scan', 'machine_learning', 'headless_browser',
+                          'mecab', 'screenshots_svc']
     setting_file = r_file(path + '/SETTING.txt')
     setting_line = setting_file.split('\n')
     for line in setting_line:
@@ -107,6 +108,8 @@ def get_setting_dict(path):
                 else:
                     if value == 0:
                         setting['MAX_process'] = cpu_count()
+                    elif value < 0:
+                        setting['MAX_process'] = cpu_count() + value if cpu_count() + value > 0 else 1
                     else:
                         setting['MAX_process'] = value
             elif variable in bool_variable_list:   # True or Falseの2値しか取らない設定はまとめている
@@ -187,26 +190,27 @@ def import_file(path):             # 実行でディレクトリは「crawler」
 
 
 # 必要なディレクトリを作成
-def make_dir(screenshots):          # 実行ディレクトリは「crawler」
-    if not os.path.exists('ROD/url_hash_json'):
-        os.mkdir('ROD/url_hash_json')
-    if not os.path.exists('ROD/tag_data'):
-        os.mkdir('ROD/tag_data')
-    if not os.path.exists('ROD/df_dicts'):
-        os.mkdir('ROD/df_dicts')
+def make_dir(org_path, screenshots):          # 実行ディレクトリは「crawler」
+    # RODの中に必要なディレクトリがなければ作る
+    if not os.path.exists(org_path + '/ROD/url_hash_json'):
+        os.mkdir(org_path + '/ROD/url_hash_json')
+    if not os.path.exists(org_path + '/ROD/tag_data'):
+        os.mkdir(org_path + '/ROD/tag_data')
+    if not os.path.exists(org_path + '/ROD/df_dicts'):
+        os.mkdir(org_path + '/ROD/df_dicts')
 
-    if not os.path.exists('RAD/df_dict'):
-        os.mkdir('RAD/df_dict')
-    if not os.path.exists('RAD/temp'):
-        os.mkdir('RAD/temp')
-    if not os.path.exists('result'):
-        os.mkdir('result')
-    # if not os.path.exists('result/alert'):
-    #     os.mkdir('result/alert')
-
+    # RADの中に必要なディレクトリを作る
+    if not os.path.exists(org_path + '/RAD/df_dict'):
+        os.mkdir(org_path + '/RAD/df_dict')
+    if not os.path.exists(org_path + '/RAD/temp'):
+        os.mkdir(org_path + '/RAD/temp')
     if screenshots:
-        if not os.path.exists('RAD/screenshots'):
-            os.mkdir('RAD/screenshots')
+        if not os.path.exists(org_path + '/RAD/screenshots'):
+            os.mkdir(org_path + '/RAD/screenshots')
+
+    # resultディレクトリを作る(今回のクローリング結果を保存する場所)
+    if not os.path.exists(org_path + '/result'):
+        os.mkdir(org_path + '/result')
 
 
 # いろいろと最初の処理
@@ -228,7 +232,7 @@ def init(first_time, setting_dict):    # 実行ディレクトリは「result」
             waiting_list.append((ini, 'START'))
     else:
         if not os.path.exists('result_' + str(first_time)):
-            print('init : result_' + str(first_time) + 'that is the result of previous crawling is not found.')
+            print('init : result_' + str(first_time) + ' that is the result of previous crawling is not found.')
             return False
         # 総達成数
         data_temp = r_json('result_' + str(first_time) + '/all_achievement')
@@ -260,6 +264,7 @@ def init(first_time, setting_dict):    # 実行ディレクトリは「result」
     summarize_alert_q['recv'] = recvq  # 子プロセスが受け取る用のキュー
     summarize_alert_q['send'] = sendq  # 子プロセスから送信する用のキュー
     p = Process(target=summarize_alert_main, args=(recvq, sendq, nth))
+    p.daemon = True
     p.start()
     summarize_alert_q['process'] = p
 
@@ -270,6 +275,7 @@ def init(first_time, setting_dict):    # 実行ディレクトリは「result」
         clamd_q['recv'] = recvq   # clamdプロセスが受け取る用のキュー
         clamd_q['send'] = sendq   # clamdプロセスから送信する用のキュー
         p = Process(target=clamd_main, args=(recvq, sendq))
+        p.daemon = True
         p.start()
         clamd_q['process'] = p
         if sendq.get(block=True):
@@ -315,7 +321,7 @@ def get_achievement_amount():
     return achievement
 
 
-# 5秒ごとに途中経過表示、メインループが動いてることの確認のため、スレッド化していない
+# 10秒ごとに途中経過表示、メインループが動いてることの確認のため、スレッド化していない
 def print_progress(run_time_pp, current_achievement):
     global send_num, recv_num
     alive_count = get_alive_child_num()
@@ -327,11 +333,12 @@ def print_progress(run_time_pp, current_achievement):
         if remaining_num == 0:
             count += 1    # URL待機リストが空のホスト数をカウント
         else:
-            if host in hostName_process:
-                print('main : ' + host + "'s remaining is " + str(remaining_num) +
-                      '\t active = ' + str(hostName_process[host].is_alive()))
-            else:
-                print('main : ' + host + "'s remaining is " + str(remaining_num) + "\t active = isn't made")
+            pass
+            # if host in hostName_process:
+            #     print('main : ' + host + "'s remaining is " + str(remaining_num) +
+            #           '\t active = ' + str(hostName_process[host].is_alive()))
+            # else:
+            #     print('main : ' + host + "'s remaining is " + str(remaining_num) + "\t active = isn't made")
     print('main : remaining=0 is ' + str(count))
     print('main : run time = ' + str(run_time_pp) + 's.')
     print('main : recv-URL : send-URL = ' + str(recv_num) + ' : ' + str(send_num))
@@ -400,13 +407,13 @@ def end():
 def make_url_list(now_time):
     del_list = list()
     for thread in thread_set:
-        if type(thread.result) is not int:     # そのスレッドが最後まで実行されたか
+        if type(thread.result) is not int:     # resultの初期値はtime.time()。 上書きされているとチェックが終わったということ
             if thread.result is True:
                 url_db[thread.url_tuple[0]] = 'True,' + str(nth)               # 立命館URL
                 url_list.append((thread.url_tuple[0], thread.url_tuple[1]))    # URLのタプルを検索リストに追加
             elif thread.result == 'black':
                 url_db[thread.url_tuple[0]] = 'Black,' + str(nth)  # 対象URLだがblackリストでフィルタリングされたURL
-            else:   # (Falseか'unknown')
+            else:   # (False or unknown)
                 url_db[thread.url_tuple[0]] = 'False,' + str(nth)
                 # タプルの長さが3の場合はリダイレクト後のURL
                 if len(thread.url_tuple) == 3:
@@ -433,16 +440,14 @@ def make_url_list(now_time):
                         data_temp['content'] = thread.url_tuple[2] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[0]
                         data_temp['label'] = 'URL,SOURCE,REDIRECT_URL'
                         summarize_alert_q['recv'].put(data_temp)
-                        # wa_file('../alert/after_redirect_check.csv',
-                        #         thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
                     # 一応すべて外部出力
-                    wa_file('after_redirect.csv',
-                            thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n')
+                    w_file('after_redirect.csv',
+                           thread.url_tuple[0] + ',' + thread.url_tuple[1] + ',' + thread.url_tuple[2] + '\n', mode="a")
             del_list.append(thread)
             thread.lock.release()    # スレッドは最後にロックをして待っているのでリリースして終わらせる
         else:
             if now_time - thread.result > 300:    # 300秒経っても終わらない場合は削除
-                wa_file('cant_done_check_thread.csv', thread.url_tuple[0] + ',' + thread.url_tuple[1] + '\n')
+                w_file('cant_done_check_thread.csv', thread.url_tuple[0] + ',' + thread.url_tuple[1] + '\n', mode="a")
                 del_list.append(thread)
                 thread.lock.release()   # スレッドは最初にロックをしているのでリリースしておく
     for thread in del_list:
@@ -462,7 +467,7 @@ def thread_start(url_tuple):
 
 
 # クローリングプロセスを生成する、既に一度作ったことがある場合は、プロセスだけ作る
-def make_process(host_name, setting_dict, conn, n):
+def make_process(host_name, setting_dict, n, org_path):
     if host_name not in hostName_process:   # まだ作られていない場合、プロセス作成
         # 子プロセスと通信するキューを作成
         child_sendq = Queue()
@@ -486,17 +491,16 @@ def make_process(host_name, setting_dict, conn, n):
             args_dic['screenshots_svc_q'] = screenshots_svc_q['recv']
         else:
             args_dic['screenshots_svc_q'] = False
-        if setting_dict['mysql']:
-            args_dic['mysql'] = {'conn': conn, 'n': str(n)}
-        else:
-            args_dic['mysql'] = False
-        args_dic['phantomjs'] = setting_dict['phantomjs']
+        args_dic['nth'] = str(n)
+        args_dic['headless_browser'] = setting_dict['headless_browser']
         args_dic['mecab'] = setting_dict['mecab']
         args_dic['screenshots'] = setting_dict['screenshots']
+        args_dic['org_path'] = org_path
         hostName_args[host_name] = args_dic    # クローラプロセスの引数は、サーバ毎に毎回同じなので保存しておく
 
         # プロセス作成
         p = Process(target=crawler_main, name=host_name, args=(hostName_args[host_name],))
+        #p.daemon = True   # 親が死ぬと子も死ぬ
         p.start()    # スタート
 
         # いろいろ保存
@@ -510,6 +514,7 @@ def make_process(host_name, setting_dict, conn, n):
         print('main : ' + host_name + ' is not alive.')
         # プロセス作成
         p = Process(target=crawler_main, name=host_name, args=(hostName_args[host_name],))
+        #p.daemon = True     # 親が死ぬと子も死ぬ
         p.start()   # スタート
         hostName_process[host_name] = p   # プロセスを指す辞書だけ更新する
         print('main : ' + host_name + " 's process start. " + 'pid =' + str(p.pid))
@@ -526,6 +531,7 @@ def get_alive_child_num():
 
 # 子プロセスからの情報を受信する、plzを受け取るとURLを送信する
 # 受信したリストの中のURLはwaiting_list(クローリングするURLかのチェック待ちリスト)に追加する。
+# not_send=Trueのとき、子プロセスにはURLを送信しない。子プロセスからのデータを受け取りたいだけの時に使う。
 def receive_and_send(not_send=False):
     # 受信する型は、辞書、タプル、文字列の3種類
     # {'type': '文字列', 'url_tuple_list': [(url, src), (url, src),...]}の辞書
@@ -545,12 +551,17 @@ def receive_and_send(not_send=False):
                 else:
                     if hostName_remaining[host_name]['URL_list']:
                         # クローリングするurlを送信
-                        url_tuple = hostName_remaining[host_name]['URL_list'].popleft()
-                        hostName_remaining[host_name]['update_flag'] = True
-                        if url_tuple[0] not in assignment_url_set:  # 一度送ったURLは送らない
-                            assignment_url_set.add(url_tuple[0])
-                            queue['parent_send'].put(url_tuple)
-                            send_num += 1
+                        while True:
+                            url_tuple = hostName_remaining[host_name]['URL_list'].popleft()
+                            hostName_remaining[host_name]['update_flag'] = True
+                            if url_tuple[0] not in assignment_url_set:  # 一度送ったURLは送らない
+                                assignment_url_set.add(url_tuple[0])
+                                queue['parent_send'].put(url_tuple)
+                                send_num += 1
+                                break
+                            if not hostName_remaining[host_name]['URL_list']:  # 待機リストが空になるとbreak
+                                queue['parent_send'].put('nothing')
+                                break
                     else:
                         # もうURLが残ってないことを教える
                         queue['parent_send'].put('nothing')
@@ -573,26 +584,38 @@ def receive_and_send(not_send=False):
                     data_temp['content'] = url_tuple[0] + ',' + url_tuple[1]
                     data_temp['label'] = 'NEW_WINDOW_URL,URL'
                     summarize_alert_q['recv'].put(data_temp)
-                    # wa_file('../alert/new_window_url.csv', url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
             elif received_data['type'] == 'redirect':
                 url_tuple = received_data['url_tuple_list'][0]   # リダイレクトの場合、リストの要素数は１個だけ
                 if url_tuple[0] in url_db:
                     value = url_db[url_tuple[0]].decode('utf-8')
-                    value = value[0:value.find(',')]
-                    if value == 'False':
+                    flag = value[0:value.find(',')]
+                    if flag == 'False':
                         redirect_host = urlparse(url_tuple[0]).netloc
-                        if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
+                        redirect_path = urlparse(url_tuple[0]).path
+                        w_alert_flag = True
+                        # リダイレクト後であった場合、ホスト名を見てあやしければ外部出力
+                        # if not [white for white in after_redirect_list if redirect_host.endswith(white)]:
+                        # ホスト名+パスの途中 までを見ることにしたので、上記の一行では判断できなくなった
+                        for white_redirect_url in after_redirect_list:
+                            if '+' in white_redirect_url:
+                                white_host = white_redirect_url[0:white_redirect_url.find('+')]
+                                white_path = white_redirect_url[white_redirect_url.find('+') + 1:]
+                            else:
+                                white_host = white_redirect_url
+                                white_path = ''
+                            if redirect_host.endswith(white_host) and redirect_path.startswith(white_path):
+                                w_alert_flag = False
+                        if w_alert_flag:
                             data_temp = dict()
                             data_temp['url'] = url_tuple[0]
                             data_temp['src'] = url_tuple[1]
-                            data_temp['file_name'] = 'after_redirect_check.csv'
+                            data_temp['file_name'] = 'after_redirect_check.csv'  # 同じ情報が二度このファイルに載ってしまうことがある。
+                            # url_dbにリダイレクト後のURLが登録されており、組織外だった場合、ここで記録される。二回目はmake_url_list()内で記録される。
                             data_temp['content'] = url_tuple[2] + ',' + url_tuple[1] + ',' + url_tuple[0]
                             data_temp['label'] = 'URL,SOURCE,REDIRECT_URL'
                             summarize_alert_q['recv'].put(data_temp)
-                            # wa_file('../alert/after_redirect_check.csv',
-                            #         url_tuple[0] + ',' + url_tuple[1] + ',' + url_tuple[2] + '\n')
-                        wa_file('after_redirect.csv',
-                                url_tuple[2] + ',' + url_tuple[1] + ',' + url_tuple[0] + '\n')
+                        w_file('after_redirect.csv',
+                               url_tuple[2] + ',' + url_tuple[1] + ',' + url_tuple[0] + '\n', mode="a")
 
             # waitingリストに追加。既に割り当て済みの場合は追加しない。
             url_tuple_list = received_data['url_tuple_list']
@@ -614,6 +637,8 @@ def receive_and_send(not_send=False):
                                 waiting_list.append(url_tuple)  # 前回はFalseだが、今回もう一度チェックする(ipアドレスの取得に失敗したものもFalseのため)
 
 
+# url_tupleのリンクURLをクローリングするための辞書に登録する
+# hostName_remaining[host] = {URL_list: [], update_flag: bool}
 def allocate_to_host_remaining(url_tuple):
     host_name = urlparse(url_tuple[0]).netloc
     if host_name not in hostName_remaining:
@@ -626,7 +651,6 @@ def allocate_to_host_remaining(url_tuple):
 # hostName_processの整理(死んでいるプロセスのインスタンスを削除、queueの削除)
 # 子プロセスが終了しない、子のメインループも回ってなく、どこかで止まっている場合、親から強制終了させる
 # 基準は、待機キューに同じデータが300秒以上入っているかどうか　としていたが、update_flagを作ったのでそれで判断
-# 通信キューにURLを溜めないようにしたので変更
 def del_child(now):
     del_process_list = list()
     for host_name, process_dc in hostName_process.items():
@@ -640,7 +664,9 @@ def del_child(now):
                     process_dc.terminate()  # 300秒ずっと待機URLリストが変化なかったので終了させる
                     del hostName_time[host_name]
                     print('main : terminate ' + str(process_dc) + ' because it was alive over 300 second')
-                    wa_file('notice.txt', str(process_dc) + ' is deleted.\n')
+                    w_file('notice.txt', str(process_dc) + ' is deleted.\n', mode="a")
+                    kill_chrome(process="geckodriver")
+                    kill_chrome(process='firefox')
                 else:   # 300秒経っていない場合、remainingリストからURLが取り出されていたら、時間を更新
                     if hostName_remaining[host_name]['update_flag']:
                         hostName_time[host_name] = now
@@ -671,24 +697,26 @@ def del_child(now):
         del hostName_queue[host_name]
 
 
-def crawler_host(n=None):
+def crawler_host(org_arg=None):
     global nth
-    # spawnで子プロセスを生成するように(windowsではデフォ、unixではforkがデフォ)
+    # spawnで子プロセスを生成しているかチェック(windowsではデフォ、unixではforkがデフォ)
     print(get_context())
 
-    # n : 何回目のクローリングか
-    if n is None:
+    if org_arg is None:
         os._exit(255)
-    nth = n
+
+    nth = org_arg['result_no']      # result_historyの中のresultの数+1(何回目のクローリングか)
+    org_path = org_arg['org_path']  # 組織ごとのディレクトリパス。設定ファイルや結果を保存するところ ".../organization/組織名"
+
     global hostName_achievement, hostName_process, hostName_queue, hostName_remaining, hostName_time, fewest_host
     global waiting_list, url_list, assignment_url_set, thread_set
     global remaining, send_num, recv_num, all_achievement
     start = int(time())
 
     # 設定データを読み込み
-    setting_dict = get_setting_dict(path='ROD/LIST')
+    setting_dict = get_setting_dict(path=org_path + '/ROD/LIST')
     if None in setting_dict.values():
-        print('main : check the SETTING.txt')
+        print(' main : check the SETTING.txt in ' + org_path + '/ROD/LIST')
         os._exit(255)
     assign_or_achievement = setting_dict['assignOrAchievement']
     max_process = setting_dict['MAX_process']
@@ -697,50 +725,49 @@ def crawler_host(n=None):
     save_time = setting_dict['SAVE_time']
     run_count = setting_dict['run_count']
     screenshots = setting_dict['screenshots']
-    mysql = setting_dict['mysql']
 
     # 一回目の実行の場合
     if run_count == 0:
-        if os.path.exists('RAD'):
+        if os.path.exists(org_path + '/RAD'):
             print('RAD directory exists.')
-            print('If this running is at first time, please delete this dire.')
+            print('If this running is at first time, please delete this one.')
             print('Else, you should check the run_count in SETTING.txt.')
             os._exit(255)
-        os.mkdir('RAD')
-        make_dir(screenshots)
-        copytree('ROD/url_hash_json', 'RAD/url_hash_json')
-        copytree('ROD/tag_data', 'RAD/tag_data')
-        if os.path.exists('ROD/url_db'):
-            copyfile('ROD/url_db', 'RAD/url_db')
-        with open('RAD/READ.txt', 'w') as f:
-            f.writelines("This directory's files are read and written.\n")
-            f.writelines("On the other hand, ROD directory's files are not written, Read only.\n\n")
+        os.mkdir(org_path + '/RAD')
+        make_dir(org_path=org_path, screenshots=screenshots)
+        copytree(org_path + '/ROD/url_hash_json', org_path + '/RAD/url_hash_json')
+        copytree(org_path + '/ROD/tag_data', org_path + '/RAD/tag_data')
+        if os.path.exists(org_path + '/ROD/url_db'):
+            copyfile(org_path + '/ROD/url_db', org_path + '/RAD/url_db')
+        with open(org_path + '/RAD/READ.txt', 'w') as f:
+            f.writelines("This directory's files can be read and written.\n")
+            f.writelines("On the other hand, ROD directory's files are not written, Read Only Data.\n\n")
             f.writelines('------------------------------------\n')
             f.writelines('When crawling is finished, you should overwrite the ROD/...\n')
             f.writelines('tag_data/, url_hash_json/\n')
             f.writelines("... by this directory's ones for next crawling by yourself.\n")
             f.writelines('Then, you move df_dict in this directory to ROD/df_dicts/ to calculate idf_dict.\n')
             f.writelines('After you done these, you may delete this(RAD) directory.\n')
-            f.writelines("To calculate idf_dict, you must run 'tf_idf.py'.")
+            f.writelines("To calculate idf_dict, you must run 'tf_idf.py'.\n")
+            f.writelines('------------------------------------\n')
+            f.writelines('Above mentioned comment can be ignored.\n')
+            f.writelines('Because it is automatically carried out.')
 
     # 必要なリストを読み込む
-    import_file(path='ROD/LIST')
+    import_file(path=org_path + '/ROD/LIST')
 
+    # org_path + /result　に移動
     try:
-        os.chdir('result')
+        os.chdir(org_path + '/result')
     except FileNotFoundError:
-        print('You should check the run_count in setting file.')
+        print('You should check the run_count in setting file.')   # もういらないと思うけど
 
-    # databaseに必要なテーブルを作成、コネクターとカーソルを取得
-    if mysql:
-        conn = get_connector()
-        if not make_tables(conn=conn, n=n):
-            print('cannot make tables')
-            os._exit(255)
-    else:
-        conn = None
+    # メモリ使用量監視スレッド
+    t = MemoryObserverThread(limit=80, )
+    t.setDaemon(True)  # daemonにすることで、メインスレッドはこのスレッドが生きていても死ぬことができる
+    t.start()
 
-    # メインループを回すループ(save_timeが設定されていなければ、一周しかしない)
+    # メインループを回すループ(save_timeが設定されていなければ、途中保存しないため一周しかしない。一周で全て周り切る)
     while True:
         save = False
         remaining = 0
@@ -760,6 +787,7 @@ def crawler_host(n=None):
         current_start_time = int(time())
         pre_time = current_start_time
 
+        # init()から返ってきたとき、実行ディレクトリは result からその中の result/result_* に移動している
         if not init(first_time=run_count, setting_dict=setting_dict):
             os._exit(255)
 
@@ -771,7 +799,7 @@ def crawler_host(n=None):
             now = int(time())
 
             # 途中経過表示
-            if now - pre_time >= 5:
+            if now - pre_time > 10:
                 del_child(now)
                 print_progress(now - current_start_time, current_achievement)
                 pre_time = now
@@ -781,7 +809,7 @@ def crawler_host(n=None):
                 if now - start >= max_time:
                     forced_termination()
                     break
-            if assign_or_achievement:  # 指定数URLを達成したら
+            if assign_or_achievement:   # 指定数URLをアサインしたら
                 if len(assignment_url_set) >= max_page:
                     print('num of assignment reached MAX')
                     while not (get_alive_child_num() == 0):
@@ -790,7 +818,7 @@ def crawler_host(n=None):
                             if temp.is_alive():
                                 print(temp)
                     break
-            else:   # 指定数URLをアサインしたら
+            else:    # 指定数URLを達成したら
                 if (all_achievement + current_achievement) >= max_page:
                     print('num of achievement reached MAX')
                     forced_termination()
@@ -831,6 +859,16 @@ def crawler_host(n=None):
                 allocate_to_host_remaining(url_tuple=url_tuple)
 
             # プロセス数が上限に達していなければ、プロセスを生成する
+            # falsification.cysecは最優先で周る
+            host = 'falsification.cysec.cs.ritsumei.ac.jp'
+            if host in hostName_remaining:
+                if hostName_remaining[host]['URL_list']:
+                    if host in hostName_process:
+                        if not hostName_process[host].is_alive():
+                            make_process(host, setting_dict, nth, org_path)
+                    else:
+                        make_process(host, setting_dict, nth, org_path)
+
             num_of_process = max_process - get_alive_child_num()
             if num_of_process > 0:
                 # remainingリストの中で一番待機URL数が多い順プロセスを生成する
@@ -840,7 +878,7 @@ def crawler_host(n=None):
                     # 一番待機URLが少ないプロセスを1つ作る
                     fewest = tmp_list[-1][0]
                     if fewest_host is None:
-                        make_process(fewest, setting_dict, conn, n)
+                        make_process(fewest, setting_dict, nth, org_path)
                         num_of_process -= 1
                         fewest_host = fewest
                     else:
@@ -848,10 +886,10 @@ def crawler_host(n=None):
                             if hostName_process[fewest_host].is_alive():
                                 pass
                             else:
-                                make_process(fewest, setting_dict, conn, n)
+                                make_process(fewest, setting_dict, nth, org_path)
                                 num_of_process -= 1
                                 fewest_host = fewest
-                    # 多い順に作る
+                    # 待機URLが多い順に作る
                     for host_url_list_tuple in tmp_list:
                         if num_of_process <= 0:
                             break
@@ -860,7 +898,7 @@ def crawler_host(n=None):
                             if host in hostName_process:
                                 if hostName_process[host].is_alive():
                                     continue   # プロセスが活動中なら、次に多いホストを
-                            make_process(host, setting_dict, conn, n)
+                            make_process(host, setting_dict, nth, org_path)
                             num_of_process -= 1
 
         # メインループを抜け、結果表示＆保存
@@ -874,13 +912,13 @@ def crawler_host(n=None):
         run_time = int(time()) - current_start_time
         print('run time = ' + str(run_time))
         print('remaining = ' + str(remaining))
-        wa_file('result.txt', 'assignment_url_set = ' + str(len(assignment_url_set)) + '\n' +
-                'current achievement = ' + str(current_achievement) + '\n' +
-                'all achievement = ' + str(all_achievement) + '\n' +
-                'number of child-process = ' + str(len(hostName_achievement)) + '\n' +
-                'run time = ' + str(run_time) + '\n' +
-                'remaining = ' + str(remaining) + '\n' +
-                'date = ' + str(date.today()) + '\n')
+        w_file('result.txt', 'assignment_url_set = ' + str(len(assignment_url_set)) + '\n' +
+               'current achievement = ' + str(current_achievement) + '\n' +
+               'all achievement = ' + str(all_achievement) + '\n' +
+               'number of child-process = ' + str(len(hostName_achievement)) + '\n' +
+               'run time = ' + str(run_time) + '\n' +
+               'remaining = ' + str(remaining) + '\n' +
+               'date = ' + str(date.today()) + '\n', mode="a")
 
         print('main : save...')   # 途中結果を保存する
         copytree('../../RAD', 'TEMP')
@@ -913,5 +951,7 @@ def crawler_host(n=None):
             run_count += 1
             os.chdir('..')
         else:
-            print('main : End')
+            os.chdir('..')
             break
+
+    print('main : End')
